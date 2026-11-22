@@ -310,8 +310,31 @@ class BackendReliabilityTests(unittest.TestCase):
         self.assertEqual(unavailable.status_code, 503, unavailable.get_json())
         self.assertEqual(
             unavailable.get_json()["error"],
-            "AI visual review service is unavailable.",
+            "Gemini visual review is not configured. Set GEMINI_API_KEY on the backend.",
         )
+
+        with patch.object(
+            analyzer.ai_service,
+            "analyze_visual_content",
+            side_effect=GeminiVisualAnalysisUnavailableError(
+                "Gemini API quota or rate limit reached. Check the backend Gemini API usage and billing, or retry after the quota resets.",
+                response_status=429,
+            ),
+        ):
+            quota_exhausted = self.client.post(
+                "/api/analysis/visual-check",
+                data={
+                    "brand_id": str(brand_id),
+                    "file": (
+                        BytesIO(b"\x89PNG\r\n\x1a\nmock image"),
+                        "valid.png",
+                        "image/png",
+                    ),
+                },
+                content_type="multipart/form-data",
+            )
+        self.assertEqual(quota_exhausted.status_code, 429)
+        self.assertIn("quota", quota_exhausted.get_json()["error"])
 
     def test_api_security_limits_reject_oversized_json_text_and_invalid_ids(self):
         oversized_json = self.client.post(
@@ -1167,7 +1190,23 @@ class BackendReliabilityTests(unittest.TestCase):
                 })
 
         self.assertEqual(response.status_code, 503, response.get_json())
-        self.assertEqual(response.get_json()["error"], "AI rewrite service is unavailable.")
+        self.assertIn("temporarily unavailable after retries", response.get_json()["error"])
+        self.assertIn("AI rewrite could not be completed", response.get_json()["error"])
+
+        client.models.generate_content.side_effect = errors.ClientError(
+            429,
+            {"message": "quota exhausted"},
+        )
+        with patch("services.ai_service.genai.Client") as client_factory:
+            client_factory.return_value.__enter__.return_value = client
+            response = self.client.post("/api/analysis/rewrite", json={
+                "brand_id": brand_id,
+                "text": "Original content.",
+            })
+
+        self.assertEqual(response.status_code, 429, response.get_json())
+        self.assertIn("quota or rate limit", response.get_json()["error"])
+        self.assertEqual(client.models.generate_content.call_count, 4)
 
     def test_rewrite_route_reports_invalid_gemini_response(self):
         brand_id = self.create_brand()
@@ -1259,34 +1298,29 @@ class BackendReliabilityTests(unittest.TestCase):
             "font_family": "Brand Sans",
             "contrast_minimum": "4.5:1",
         }
+        requested_checks, _ = AIService._build_visual_checks(visual_rules)
         client = Mock()
         client.models.generate_content.return_value.text = json.dumps({
-            "checks": [
-                {
-                    "id": "image_quality",
-                    "status": "no_obvious_concern",
-                    "evidence": "The image is visible and not obviously blurred.",
-                    "confidence": "medium",
-                },
-                {
-                    "id": "brand_palette",
-                    "status": "concern",
-                    "evidence": "A large red area conflicts with the configured palette.",
-                    "confidence": "medium",
-                },
-                {
-                    "id": "forbidden_colors",
-                    "status": "concern",
-                    "evidence": "A prominent red background is visible.",
-                    "confidence": "medium",
-                },
-                {
-                    "id": "logo_presence",
-                    "status": "uncertain",
-                    "evidence": "A logo-like mark cannot be confidently identified.",
-                    "confidence": "low",
-                },
-            ],
+            "checks": [{
+                "id": check["id"],
+                "status": (
+                    "concern" if check["id"] == "brand_palette" else "uncertain"
+                ),
+                "severity": (
+                    "medium" if check["id"] == "brand_palette" else "undetermined"
+                ),
+                "explanation": (
+                    "A large red area conflicts with the configured palette."
+                    if check["id"] == "brand_palette"
+                    else "The relevant detail cannot be confidently evaluated."
+                ),
+                "recommendation": (
+                    "Use the configured brand palette."
+                    if check["id"] == "brand_palette"
+                    else "Manually verify this guideline."
+                ),
+                "confidence": "medium",
+            } for check in requested_checks],
         })
         service = AIService()
         service.gemini_key = "unit-test-key"
@@ -1305,14 +1339,24 @@ class BackendReliabilityTests(unittest.TestCase):
             check["manual_review_required"] for check in result["checks"]
         ))
         self.assertEqual(result["checks"][1]["status"], "concern")
+        self.assertEqual(result["checks"][1]["severity"], "medium")
+        self.assertTrue(result["checks"][1]["explanation"])
+        self.assertTrue(result["checks"][1]["recommendation"])
         self.assertEqual(result["checks"][3]["status"], "uncertain")
+        check_ids = {check["id"] for check in result["checks"]}
+        self.assertTrue({
+            "logo_placement",
+            "logo_distortion",
+            "typography",
+            "text_contrast",
+        }.issubset(check_ids))
         not_evaluated_rules = {
             item["rule"] for item in result["not_evaluated"]
         }
         self.assertIn("Exact brand color values", not_evaluated_rules)
-        self.assertIn("Font family", not_evaluated_rules)
-        self.assertIn("Minimum contrast ratio", not_evaluated_rules)
-        self.assertIn("Logo identity, placement, and clear space", not_evaluated_rules)
+        self.assertIn("Exact font-family identification", not_evaluated_rules)
+        self.assertIn("Exact WCAG contrast ratio", not_evaluated_rules)
+        self.assertIn("Approved logo identity and exact clear-space measurement", not_evaluated_rules)
 
         request = client.models.generate_content.call_args.kwargs
         self.assertEqual(request["model"], "gemini-3.6-flash")
@@ -1360,6 +1404,29 @@ class BackendReliabilityTests(unittest.TestCase):
                 {"name": "Visual Test Brand"},
                 {},
             )
+
+    def test_gemini_visual_analysis_reports_quota_exhaustion_without_audit_result(self):
+        service = AIService()
+        service.gemini_key = "unit-test-key"
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            errors.ClientError(429, {"message": "quota exhausted"})
+            for _ in range(3)
+        ]
+
+        with patch("services.ai_service.genai.Client") as client_factory:
+            client_factory.return_value.__enter__.return_value = client
+            with patch("services.ai_service.time.sleep"):
+                with self.assertRaises(GeminiVisualAnalysisUnavailableError) as raised:
+                    service.analyze_visual_content(
+                        b"\x89PNG\r\n\x1a\nmock image",
+                        "image/png",
+                        {"name": "Visual Test Brand"},
+                        {},
+                    )
+
+        self.assertIn("quota or rate limit", str(raised.exception))
+        self.assertEqual(client.models.generate_content.call_count, 1)
 
     def test_gemini_rewrite_raises_when_provider_is_unavailable(self):
         service = AIService()

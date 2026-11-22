@@ -13,7 +13,7 @@ BrandGuard AI is a brand-governance application for managing brand guidelines an
 - Record reviewer decisions, reviewer details, and comments against the reviewed content version; stale frontend submissions are rejected. Existing review history is preserved without guessing a version for older records.
 - View dashboard statistics and export a content audit report as JSON.
 
-PNG, JPEG, and WebP uploads can be sent to the backend Gemini service for a preliminary review of obvious palette conflicts, a required logo-like mark, and severe image rendering issues. Images are not saved, and every result requires manual review. Exact hex matching, approved logo identity or placement, clear-space, font, contrast, layout, and general audience/content suitability remain unsupported. A Gemini key is required for visual review. Automated analysis is not a substitute for human approval.
+PNG, JPEG, and WebP uploads are sent to the backend Gemini service for a preliminary review of configured colors, logo visibility/placement/obvious distortion, typography, visible text contrast, and severe image rendering issues when those details can be discerned. Results include severity, explanation, and recommendations; uncertain or exact measurements still require manual verification. The service does not certify exact color values, logo identity or clear-space geometry, font identity, numeric WCAG contrast ratios, layout, or general audience/content suitability. Images are not saved. A Gemini key is required on the backend, and provider or quota failures are returned as errors rather than mock audits. Automated analysis is not a substitute for human approval.
 
 Automatic corrections use exact detected spans and an explicitly configured replacement-text field. Claim disclaimers and policy explanations are not treated as replacement copy; for compatibility, only an explicitly quoted alternative following `Use:` in a legacy disclaimer is extracted as replacement text. Other existing claim rules without replacement text remain manual-review issues. Applying an individual correction or adopting all corrections creates a new content version and re-runs the analysis; grammar is not automatically certified, so human review remains required.
 
@@ -75,7 +75,7 @@ Install backend dependencies from the project directory:
 python -m pip install -r backend/requirements.txt
 ```
 
-Optionally copy `backend/.env.example` to `backend/.env` and set `GEMINI_API_KEY` to enable backend Gemini text analysis. The key stays on the backend; audit text and brand guidelines are sent to Google's Gemini API when this is enabled. Without a key, analysis uses the local rule-based engine.
+Optionally copy `backend/.env.example` to `backend/.env` and set `GEMINI_API_KEY` to enable backend Gemini text analysis and visual review. The key stays on the backend; audit text, brand guidelines, and uploaded images are sent to Google's Gemini API when the corresponding feature is used. Without a key, text audits use the local rule-based engine and visual review is unavailable. Gemini quota limits are controlled by the configured Google AI project; quota exhaustion is reported as an error and does not produce a mock review.
 
 Start the backend in one terminal:
 

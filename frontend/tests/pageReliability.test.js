@@ -1970,7 +1970,10 @@ test('ContentAnalyzer reviews image uploads separately from saved text content',
           id: 'forbidden_colors',
           rule: 'Obvious use of configured forbidden colors',
           status: 'concern',
+          severity: 'high',
+          explanation: 'A prominent red background is visible.',
           evidence: 'A prominent red background is visible.',
+          recommendation: 'Replace the background with an approved brand color.',
           confidence: 'medium',
           manual_review_required: true,
         }],
@@ -2012,6 +2015,8 @@ test('ContentAnalyzer reviews image uploads separately from saved text content',
   assert.equal(container.querySelector('textarea').value, '');
   assert.match(container.textContent, /Visual Brand Review/);
   assert.match(container.textContent, /A prominent red background is visible/);
+  assert.match(container.textContent, /high severity/);
+  assert.match(container.textContent, /Replace the background with an approved brand color/);
   assert.match(container.textContent, /Exact brand color values/);
   assert.match(container.textContent, /manual review required/i);
   await act(async () => {

@@ -1340,23 +1340,39 @@ export default function ContentAnalyzer({
                       <h3 className="text-xs font-semibold text-slate-800">
                         {check.rule}
                       </h3>
-                      <span className={`shrink-0 rounded px-2 py-0.5 text-[10px] font-semibold ${
-                        check.status === 'concern'
-                          ? 'bg-amber-100 text-amber-800'
-                          : check.status === 'no_obvious_concern'
-                            ? 'bg-emerald-100 text-emerald-800'
-                            : 'bg-slate-100 text-slate-700'
-                      }`}>
-                        {check.status === 'concern'
-                          ? 'Concern'
-                          : check.status === 'no_obvious_concern'
-                            ? 'No obvious concern'
-                            : 'Uncertain'}
-                      </span>
+                      <div className="flex shrink-0 items-center gap-1">
+                        <span className={`rounded px-2 py-0.5 text-[10px] font-semibold ${
+                          check.status === 'concern'
+                            ? 'bg-amber-100 text-amber-800'
+                            : check.status === 'no_obvious_concern'
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : 'bg-slate-100 text-slate-700'
+                        }`}>
+                          {check.status === 'concern'
+                            ? 'Concern'
+                            : check.status === 'no_obvious_concern'
+                              ? 'No obvious concern'
+                              : 'Uncertain'}
+                        </span>
+                        {check.severity && (
+                          <span className="rounded bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
+                            {check.severity === 'undetermined'
+                              ? 'Severity undetermined'
+                              : check.severity === 'none'
+                                ? 'No severity'
+                                : `${check.severity} severity`}
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <p className="mt-1.5 text-xs leading-relaxed text-slate-600">
-                      {check.evidence}
+                      {check.explanation || check.evidence}
                     </p>
+                    {check.recommendation && (
+                      <p className="mt-1 text-xs leading-relaxed text-slate-700">
+                        <span className="font-semibold">Recommendation:</span> {check.recommendation}
+                      </p>
+                    )}
                     <p className="mt-1 text-[10px] text-slate-500">
                       Confidence: {check.confidence || 'unknown'} · Manual review required
                     </p>

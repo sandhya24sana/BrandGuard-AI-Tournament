@@ -179,9 +179,12 @@ def rewrite_content():
         })
     except ValueError as error:
         return jsonify({"success": False, "error": "Brand not found."}), 404
-    except GeminiUnavailableError:
+    except GeminiUnavailableError as error:
         logger.warning("Gemini rewrite is unavailable.")
-        return jsonify({"success": False, "error": "AI rewrite service is unavailable."}), 503
+        return jsonify({
+            "success": False,
+            "error": str(error),
+        }), error.response_status
     except GeminiRewriteValidationError:
         logger.warning("Gemini rewrite response failed validation.")
         return jsonify({"success": False, "error": "AI rewrite response could not be validated."}), 502
@@ -263,12 +266,12 @@ def visual_check():
         })
     except ValueError:
         return jsonify({"success": False, "error": "Brand not found."}), 404
-    except GeminiVisualAnalysisUnavailableError:
+    except GeminiVisualAnalysisUnavailableError as error:
         logger.warning("Gemini visual analysis is unavailable.")
         return jsonify({
             "success": False,
-            "error": "AI visual review service is unavailable.",
-        }), 503
+            "error": str(error),
+        }), error.response_status
     except GeminiVisualAnalysisValidationError:
         logger.warning("Gemini visual analysis response failed validation.")
         return jsonify({
