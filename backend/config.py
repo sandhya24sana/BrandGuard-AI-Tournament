@@ -95,7 +95,7 @@ class Config:
         origin.strip()
         for origin in os.environ.get(
             "CORS_ORIGINS",
-            "http://localhost:5173,http://127.0.0.1:5173,https://brand-guard-ai-three.vercel.app"
+            "http://localhost:5173,http://127.0.0.1:5173,https://brand-guard-ai-three.vercel.app,https://brand-guard-ai-tournament.vercel.app"
         ).split(",")
         if origin.strip()
     ]
