@@ -282,6 +282,20 @@ CREATE TABLE IF NOT EXISTS reviews (
     comments TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS manual_correction_drafts (
+    id BIGSERIAL PRIMARY KEY,
+    content_id BIGINT NOT NULL REFERENCES content_items(id) ON DELETE CASCADE,
+    content_version_id BIGINT NOT NULL REFERENCES content_versions(id) ON DELETE CASCADE,
+    issue_id TEXT NOT NULL,
+    original_text TEXT NOT NULL,
+    replacement_text TEXT NOT NULL,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (content_id, content_version_id, issue_id)
+);
 """
 
 
@@ -410,6 +424,22 @@ CREATE TABLE IF NOT EXISTS reviews (
     comments TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (content_id) REFERENCES content_items(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS manual_correction_drafts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_id INTEGER NOT NULL,
+    content_version_id INTEGER NOT NULL,
+    issue_id TEXT NOT NULL,
+    original_text TEXT NOT NULL,
+    replacement_text TEXT NOT NULL,
+    start_offset INTEGER NOT NULL,
+    end_offset INTEGER NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (content_id, content_version_id, issue_id),
+    FOREIGN KEY (content_id) REFERENCES content_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (content_version_id) REFERENCES content_versions(id) ON DELETE CASCADE
 );
 """
 

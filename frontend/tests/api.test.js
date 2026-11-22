@@ -126,3 +126,53 @@ test('visual review API sends the image and brand without exposing configuration
   assert.equal(result.saved, false);
   assert.equal(result.visual_validation.supported, true);
 });
+
+test('PDF report API requests a brand-scoped PDF and returns its binary blob', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let requestUrl;
+  globalThis.fetch = async (url) => {
+    requestUrl = String(url);
+    return new Response(new Blob(['%PDF-1.4 test bytes'], {
+      type: 'application/pdf',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/pdf' },
+    });
+  };
+
+  const result = await api.downloadAuditReportPdf(55, 7);
+
+  assert.ok(requestUrl.endsWith('/api/history/export/55/pdf?brand_id=7'));
+  assert.equal(result.success, true);
+  assert.equal(result.blob.type, 'application/pdf');
+  assert.ok(result.blob.size > 0);
+});
+
+test('PDF report API surfaces server errors and rejects invalid identifiers', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let requestCount = 0;
+  globalThis.fetch = async () => {
+    requestCount += 1;
+    return new Response(JSON.stringify({
+      success: false,
+      error: 'No audit result is available.',
+    }), {
+      status: 404,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const missingAudit = await api.downloadAuditReportPdf(55, 7);
+  const invalidBrand = await api.downloadAuditReportPdf(55, 0);
+
+  assert.equal(missingAudit.success, false);
+  assert.equal(missingAudit.error, 'No audit result is available.');
+  assert.equal(invalidBrand.success, false);
+  assert.equal(requestCount, 1);
+});

@@ -5,6 +5,7 @@ from typing import List, Dict, Any, Optional, Tuple
 
 from services.correction_engine import (
     apply_corrections,
+    attach_replacement_options,
     legacy_claim_replacement,
     legacy_terminology_replacement,
     safe_replacement_text,
@@ -963,6 +964,7 @@ class RuleBasedAnalyzer:
                             "rule_name", "Regulatory Compliance"
                         ),
                         "matched_text": matched_text,
+                        "trigger_text": matched_text,
                         "location": {"start": start, "end": end},
                         "explanation": (
                             rule.get("explanation")
@@ -1199,6 +1201,7 @@ class RuleBasedAnalyzer:
     ) -> str:
         """Build a preview using only validated, exact-span replacements."""
 
+        attach_replacement_options(text, issues)
         correction_plan = apply_corrections(text, issues)
         conflicting_issue_ids = set(
             correction_plan.get("conflicting_issue_ids", [])

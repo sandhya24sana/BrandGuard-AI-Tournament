@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
   Sparkles, Upload, FileText, CheckCircle2, AlertTriangle, ShieldCheck, 
-  RotateCcw, Check, Layers, Clock, AlertCircle, XCircle
+  RotateCcw, Check, Layers, Clock, AlertCircle, XCircle, Download
 } from 'lucide-react';
 import { api } from '../api';
 import RiskScoreBadge from '../components/RiskScoreBadge';
@@ -9,11 +9,85 @@ import IssueCard from '../components/IssueCard';
 import DiffViewer from '../components/DiffViewer';
 import ReviewActionModal from '../components/ReviewActionModal';
 
+function getAuditPdfFilename(brandName) {
+  const safeBrandName = Array.from(String(brandName || 'Brand'), (character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint < 32 || codePoint === 127 || /[<>:"/\\|?*]/.test(character)
+      ? '_'
+      : character;
+  }).join('')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'Brand';
+  return `BrandGuard_Audit_Report_${safeBrandName}.pdf`;
+}
+
+const CONTENT_DRAFT_STORAGE_PREFIX = 'brandguard.content-analyzer-draft.v1';
+
+function getContentDraftStorageKey(brandId, contentId) {
+  if (!Number.isSafeInteger(brandId) || brandId < 1) return null;
+  if (
+    contentId !== null
+    && (!Number.isSafeInteger(contentId) || contentId < 1)
+  ) {
+    return null;
+  }
+  return `${CONTENT_DRAFT_STORAGE_PREFIX}:brand:${brandId}:content:${contentId ?? 'new'}`;
+}
+
+function readContentDraft(brandId, contentId) {
+  const key = getContentDraftStorageKey(brandId, contentId);
+  if (!key) return null;
+  try {
+    const stored = JSON.parse(window.localStorage.getItem(key) || 'null');
+    if (
+      !stored
+      || stored.brandId !== brandId
+      || stored.contentId !== contentId
+      || typeof stored.text !== 'string'
+    ) {
+      return null;
+    }
+    return stored;
+  } catch (error) {
+    console.warn('Could not restore the Content Analyzer draft:', error);
+    return null;
+  }
+}
+
+function writeContentDraft(draft) {
+  const key = getContentDraftStorageKey(draft.brandId, draft.contentId);
+  if (!key || typeof draft.text !== 'string') return false;
+  try {
+    window.localStorage.setItem(key, JSON.stringify({
+      brandId: draft.brandId,
+      contentId: draft.contentId,
+      text: draft.text,
+      updatedAt: Date.now(),
+    }));
+    return true;
+  } catch (error) {
+    console.warn('Could not save the Content Analyzer draft:', error);
+    return false;
+  }
+}
+
+function removeContentDraft(brandId, contentId) {
+  const key = getContentDraftStorageKey(brandId, contentId);
+  if (!key) return;
+  try {
+    window.localStorage.removeItem(key);
+  } catch (error) {
+    console.warn('Could not clear the Content Analyzer draft:', error);
+  }
+}
+
 export default function ContentAnalyzer({
   brandId,
   brandName,
   contentToEdit,
-  onCancelEdit
+  onCancelEdit,
+  onContentSaved,
 }) {
   // Metadata
   const [title, setTitle] = useState('');
@@ -29,6 +103,8 @@ export default function ContentAnalyzer({
   const [isSavingRewrite, setIsSavingRewrite] = useState(false);
   const [rewritePreview, setRewritePreview] = useState(null);
   const [rewriteError, setRewriteError] = useState('');
+  const [pdfDownloadError, setPdfDownloadError] = useState('');
+  const [isDownloadingPdf, setIsDownloadingPdf] = useState(false);
   const [contentId, setContentId] = useState(null);
   const [savedText, setSavedText] = useState('');
   const [currentVersion, setCurrentVersion] = useState(1);
@@ -45,6 +121,7 @@ export default function ContentAnalyzer({
   const [revisionText, setRevisionText] = useState(null);
   const [revisionComplianceApproved, setRevisionComplianceApproved] = useState(false);
   const [selectedReplacementOptions, setSelectedReplacementOptions] = useState({});
+  const [manualCorrectionForms, setManualCorrectionForms] = useState({});
   const [activeRightTab, setActiveRightTab] = useState('issues'); // 'issues', 'diff', 'readability'
   const [selectedCategory, setSelectedCategory] = useState('ALL');
 
@@ -57,6 +134,12 @@ export default function ContentAnalyzer({
   const fileInputRef = useRef(null);
   const isApplyingFixRef = useRef(false);
   const rewriteRequestRef = useRef(0);
+  const manualPreviewRequestRef = useRef(0);
+  const pdfDownloadRequestRef = useRef(false);
+  const editorDraftTimerRef = useRef(null);
+  const pendingEditorDraftRef = useRef(null);
+  const skipNextEditorDraftSaveRef = useRef(false);
+  const clearedEditorDraftRef = useRef(null);
   const [isApplyingFix, setIsApplyingFix] = useState(false);
 
   const showToast = (msg, type = 'success') => {
@@ -71,38 +154,215 @@ export default function ContentAnalyzer({
   };
 
   const clearRewritePreview = () => {
+    const previewToDiscard = rewritePreview;
     rewriteRequestRef.current += 1;
+    manualPreviewRequestRef.current += 1;
     setRewritePreview(null);
     setRewriteError('');
     setIsRewriting(false);
+    if (
+      previewToDiscard?.type === 'manual'
+      && contentId
+      && previewToDiscard.currentVersionId
+    ) {
+      api.discardManualCorrections(
+        contentId,
+        brandId,
+        previewToDiscard.currentVersionId,
+      ).then((response) => {
+        if (!response.success) {
+          showToast(
+            response.error || 'Could not discard the saved manual correction preview.',
+            'error',
+          );
+        }
+      });
+    }
   };
 
   useEffect(() => {
+    const requestId = ++manualPreviewRequestRef.current;
     rewriteRequestRef.current += 1;
     setRewritePreview(null);
     setRewriteError('');
     setIsRewriting(false);
     const originalText = contentToEdit?.original_text || '';
+    const draftContentId = contentToEdit?.id ?? null;
+    const nextDraftKey = getContentDraftStorageKey(brandId, draftContentId);
+    const pendingDraft = pendingEditorDraftRef.current;
+    if (
+      pendingDraft
+      && getContentDraftStorageKey(
+        pendingDraft.brandId,
+        pendingDraft.contentId,
+      ) !== nextDraftKey
+    ) {
+      writeContentDraft(pendingDraft);
+    }
+    skipNextEditorDraftSaveRef.current = true;
+    const editorDraft = readContentDraft(brandId, draftContentId);
+    const restoredText = editorDraft?.text ?? originalText;
+    const restoredAnalysis = contentToEdit?.latest_analysis;
+    const restoredVersion = contentToEdit?.current_version || 1;
+    const canRestoreAnalysis = Boolean(
+      restoredAnalysis
+      && restoredAnalysis.version_number === restoredVersion
+      && Array.isArray(restoredAnalysis.issues),
+    );
     setTitle(contentToEdit?.title || '');
     setContentType(contentToEdit?.content_type || 'Ad Copy');
     setChannel(contentToEdit?.channel || 'Digital Ads');
-    setText(originalText);
-    setAnalysisResult(null);
-    setAuditedVersion(null);
-    setIsAuditStale(false);
+    setText(restoredText);
+    setAnalysisResult(canRestoreAnalysis ? restoredAnalysis : null);
+    setAuditedVersion(canRestoreAnalysis ? restoredVersion : null);
+    setIsAuditStale(Boolean(editorDraft && editorDraft.text !== originalText));
     setVisualResult(null);
     setVisualFileName('');
     setVisualError('');
-    setRevisionOriginalText(null);
-    setRevisionText(null);
+    setRevisionOriginalText(canRestoreAnalysis ? originalText : null);
+    setRevisionText(
+      canRestoreAnalysis
+        ? (restoredAnalysis.corrected_text || originalText)
+        : null,
+    );
     setRevisionComplianceApproved(false);
     setSelectedReplacementOptions({});
+    setManualCorrectionForms({});
     setContentId(contentToEdit?.id || null);
     setSavedText(originalText);
-    setCurrentVersion(contentToEdit?.current_version || 1);
+    setCurrentVersion(restoredVersion);
     setStatus(contentToEdit?.status || 'draft');
     setIsReviewModalOpen(false);
+
+    if (contentToEdit?.id && brandId) {
+      api.getManualCorrectionPreview(contentToEdit.id, brandId).then((response) => {
+        if (manualPreviewRequestRef.current !== requestId) return;
+        if (!response.success) {
+          setRewriteError(
+            response.error || 'Could not retrieve the saved manual correction preview.',
+          );
+          return;
+        }
+        const previewState = response.preview_state;
+        if (!previewState?.correction_count) return;
+        setRewritePreview({
+          type: 'manual',
+          rewrittenText: previewState.corrected_text,
+          currentVersionId: response.current_version_id,
+          source: {
+            brandId,
+            text: originalText,
+            contentType: contentToEdit?.content_type || 'Ad Copy',
+            channel: contentToEdit?.channel || 'Digital Ads',
+            currentVersion: contentToEdit?.current_version || 1,
+          },
+        });
+      });
+    }
+    return () => {
+      manualPreviewRequestRef.current += 1;
+    };
   }, [brandId, contentToEdit]);
+
+  const draftContentId = contentToEdit?.id ?? contentId ?? null;
+
+  useEffect(() => {
+    if (!brandId) return undefined;
+
+    const draft = { brandId, contentId: draftContentId, text };
+    const clearedDraft = clearedEditorDraftRef.current;
+    if (
+      clearedDraft
+      && clearedDraft.brandId === draft.brandId
+      && clearedDraft.contentId === draft.contentId
+      && clearedDraft.text === draft.text
+    ) {
+      pendingEditorDraftRef.current = null;
+      return undefined;
+    }
+    clearedEditorDraftRef.current = null;
+
+    if (skipNextEditorDraftSaveRef.current) {
+      skipNextEditorDraftSaveRef.current = false;
+      pendingEditorDraftRef.current = null;
+      return undefined;
+    }
+
+    pendingEditorDraftRef.current = draft;
+    const timerId = window.setTimeout(() => {
+      writeContentDraft(draft);
+      if (editorDraftTimerRef.current === timerId) {
+        editorDraftTimerRef.current = null;
+      }
+    }, 500);
+    editorDraftTimerRef.current = timerId;
+
+    return () => {
+      window.clearTimeout(timerId);
+      if (editorDraftTimerRef.current === timerId) {
+        editorDraftTimerRef.current = null;
+      }
+    };
+  }, [brandId, contentId, contentToEdit, draftContentId, text]);
+
+  useEffect(() => {
+    const flushPendingDraft = () => {
+      if (editorDraftTimerRef.current !== null) {
+        window.clearTimeout(editorDraftTimerRef.current);
+        editorDraftTimerRef.current = null;
+      }
+      if (pendingEditorDraftRef.current) {
+        writeContentDraft(pendingEditorDraftRef.current);
+      }
+    };
+    window.addEventListener('pagehide', flushPendingDraft);
+    return () => {
+      window.removeEventListener('pagehide', flushPendingDraft);
+      flushPendingDraft();
+    };
+  }, []);
+
+  const moveEditorDraftToContent = (nextContentId, draftText) => {
+    const previousContentId = contentToEdit?.id ?? contentId ?? null;
+    const nextDraft = {
+      brandId,
+      contentId: nextContentId,
+      text: draftText,
+    };
+    if (editorDraftTimerRef.current !== null) {
+      window.clearTimeout(editorDraftTimerRef.current);
+      editorDraftTimerRef.current = null;
+    }
+    if (writeContentDraft(nextDraft)) {
+      if (previousContentId !== nextContentId) {
+        removeContentDraft(brandId, previousContentId);
+      }
+    }
+    pendingEditorDraftRef.current = nextDraft;
+  };
+
+  const clearEditorDraft = (
+    nextContentId = contentToEdit?.id ?? contentId ?? null,
+    clearedText = text,
+  ) => {
+    if (editorDraftTimerRef.current !== null) {
+      window.clearTimeout(editorDraftTimerRef.current);
+      editorDraftTimerRef.current = null;
+    }
+    pendingEditorDraftRef.current = null;
+    const draftContentIds = new Set([
+      contentToEdit?.id ?? contentId ?? null,
+      nextContentId,
+    ]);
+    draftContentIds.forEach((draftContentIdToRemove) => {
+      removeContentDraft(brandId, draftContentIdToRemove);
+    });
+    clearedEditorDraftRef.current = {
+      brandId,
+      contentId: nextContentId,
+      text: clearedText,
+    };
+  };
 
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -150,6 +410,7 @@ export default function ContentAnalyzer({
         setAnalysisResult(null);
         clearRevision();
         setSelectedReplacementOptions({});
+        setManualCorrectionForms({});
         showToast(`Document parsed (${res.word_count} words extracted).`);
       } else {
         showToast(res.error || 'Upload failed', 'error');
@@ -170,6 +431,14 @@ export default function ContentAnalyzer({
   };
 
   const handleRunAnalysis = async () => {
+    if (rewritePreview?.type === 'manual') {
+      showToast(
+        'Save or discard the manual correction preview before running another audit.',
+        'error',
+      );
+      return;
+    }
+    manualPreviewRequestRef.current += 1;
     if (!brandId) {
       showToast('Create and select a brand before analyzing content.', 'error');
       return;
@@ -206,7 +475,11 @@ export default function ContentAnalyzer({
 
       if (res.success && res.result) {
         if (res.content_id) {
+          if (!contentId) {
+            moveEditorDraftToContent(res.content_id, text);
+          }
           setContentId(res.content_id);
+          onContentSaved?.(res.content_id);
         }
         setSavedText(text);
         setAnalysisResult(res.result);
@@ -216,6 +489,7 @@ export default function ContentAnalyzer({
           res.result.revision_compliance?.approved === true
         );
         setSelectedReplacementOptions({});
+        setManualCorrectionForms({});
         setCurrentVersion(res.version || 1);
         setAuditedVersion(res.version || 1);
         setIsAuditStale(false);
@@ -241,10 +515,9 @@ export default function ContentAnalyzer({
       return;
     }
 
+    clearRewritePreview();
     const requestId = ++rewriteRequestRef.current;
     const source = { brandId, text, contentType, channel };
-    setRewritePreview(null);
-    setRewriteError('');
     setIsRewriting(true);
     try {
       const res = await api.rewriteContent({
@@ -270,11 +543,24 @@ export default function ContentAnalyzer({
 
   const handleSaveRewrite = async () => {
     if (!rewritePreview || isSavingRewrite) return;
-    if (!window.confirm('Save this AI rewrite as a new content version? The current version will remain in history.')) {
+    const { rewrittenText, source, type } = rewritePreview;
+    const isManualPreview = type === 'manual';
+    const isCorrectionPreview = type === 'corrections';
+    if (
+      source.currentVersion !== undefined
+      && source.currentVersion !== currentVersion
+    ) {
+      clearRewritePreview();
+      setRewriteError('The source version changed. Run the audit again before saving this preview.');
       return;
     }
+    const confirmation = isManualPreview
+      ? 'Save this manually reviewed correction as a new content version? The current version will remain in history.'
+      : isCorrectionPreview
+        ? 'Save these validated corrections as a new content version? The current version will remain in history.'
+        : 'Save this AI rewrite as a new content version? The current version will remain in history.';
+    if (!window.confirm(confirmation)) return;
 
-    const { rewrittenText, source } = rewritePreview;
     if (
       source.brandId !== brandId ||
       source.text !== text ||
@@ -312,12 +598,19 @@ export default function ContentAnalyzer({
         text: rewrittenText,
       });
       if (!res.success || !res.result) {
-        throw new Error(res.error || 'Could not save the AI rewrite as a new version.');
+        throw new Error(
+          res.error
+          || (isCorrectionPreview
+            ? 'Could not save the corrections as a new version.'
+            : 'Could not save the AI rewrite as a new version.'),
+        );
       }
 
+      clearEditorDraft(res.content_id, rewrittenText);
       setText(rewrittenText);
       setSavedText(rewrittenText);
       setContentId(res.content_id);
+      onContentSaved?.(res.content_id);
       setAnalysisResult(res.result);
       setRevisionOriginalText(rewrittenText);
       setRevisionText(res.result.corrected_text || rewrittenText);
@@ -330,7 +623,13 @@ export default function ContentAnalyzer({
       setIsAuditStale(false);
       setStatus(res.status || 'pending_review');
       clearRewritePreview();
-      showToast(`Saved AI rewrite as version ${res.version || 1}.`);
+      showToast(
+        isManualPreview
+          ? `Saved reviewed correction as version ${res.version || 1}.`
+          : isCorrectionPreview
+            ? `Saved corrections as version ${res.version || 1}.`
+            : `Saved AI rewrite as version ${res.version || 1}.`,
+      );
     } catch (error) {
       setRewriteError(error.message || 'Could not save the AI rewrite.');
     } finally {
@@ -342,6 +641,40 @@ export default function ContentAnalyzer({
     setSelectedReplacementOptions((current) => ({
       ...current,
       [issueId]: optionId,
+    }));
+  };
+
+  const handleOpenManualEditor = (issue) => {
+    setManualCorrectionForms((current) => ({
+      ...current,
+      [issue.id]: {
+        open: true,
+        replacementText: issue.replacement_text || issue.suggestion || '',
+        error: '',
+        isApproving: false,
+      },
+    }));
+  };
+
+  const handleManualReplacementChange = (issueId, replacementText) => {
+    setManualCorrectionForms((current) => ({
+      ...current,
+      [issueId]: {
+        ...current[issueId],
+        replacementText,
+        error: '',
+      },
+    }));
+  };
+
+  const handleCancelManualEditor = (issueId) => {
+    setManualCorrectionForms((current) => ({
+      ...current,
+      [issueId]: {
+        ...current[issueId],
+        open: false,
+        error: '',
+      },
     }));
   };
 
@@ -365,12 +698,110 @@ export default function ContentAnalyzer({
       setIsAuditStale(true);
       throw new Error('The audited content version is stale. Run the audit again.');
     }
+    return latestContent;
+  };
+
+  const handleApproveManualCorrection = async (issue, replacementText) => {
+    setManualCorrectionForms((current) => ({
+      ...current,
+      [issue.id]: {
+        ...current[issue.id],
+        isApproving: true,
+        error: '',
+      },
+    }));
+    try {
+      if (!contentId) {
+        throw new Error('Run an audit before approving a manual correction.');
+      }
+      if (savedText !== text) {
+        setIsAuditStale(true);
+        throw new Error('The source text changed. Run the audit again before approving this correction.');
+      }
+
+      const latestContent = await verifyCurrentAuditVersion();
+      const versionRecord = latestContent.versions?.find(
+        (version) => version.version_number === auditedVersion,
+      );
+      if (!versionRecord?.id) {
+        throw new Error('Could not verify the audited version. Run the audit again.');
+      }
+      const location = issue.location;
+      if (
+        !Number.isInteger(location?.start)
+        || !Number.isInteger(location?.end)
+        || location.start < 0
+        || location.end <= location.start
+      ) {
+        throw new Error('The issue has no valid source span. Run the audit again.');
+      }
+
+      const response = await api.approveManualCorrection({
+        content_id: contentId,
+        brand_id: brandId,
+        current_version_id: versionRecord.id,
+        issue_id: issue.id,
+        original_text: issue.matched_text,
+        replacement_text: replacementText,
+        source_text: savedText,
+        source_start: location.start,
+        source_end: location.end,
+      });
+      if (!response.success) {
+        if (response.stale) setIsAuditStale(true);
+        throw new Error(response.error || 'The manual correction could not be approved.');
+      }
+      if (!response.preview_state?.corrected_text) {
+        throw new Error('The server did not return a validated correction preview.');
+      }
+
+      setRewritePreview({
+        type: 'manual',
+        rewrittenText: response.preview_state.corrected_text,
+        currentVersionId: response.current_version_id,
+        source: {
+          brandId,
+          text: savedText,
+          contentType,
+          channel,
+          currentVersion: auditedVersion,
+        },
+      });
+      setRewriteError('');
+      setManualCorrectionForms((current) => ({
+        ...current,
+        [issue.id]: {
+          ...current[issue.id],
+          open: false,
+          isApproving: false,
+          error: '',
+        },
+      }));
+      showToast(
+        'Correction added to the preview. It is not compliance-approved or saved yet.',
+        'info',
+      );
+    } catch (error) {
+      setManualCorrectionForms((current) => ({
+        ...current,
+        [issue.id]: {
+          ...current[issue.id],
+          isApproving: false,
+          error: error.message || 'The manual correction could not be approved.',
+        },
+      }));
+    }
   };
 
   const handleApplySingleFix = async (issue, selectedIssueId = issue.id) => {
     if (isApplyingFixRef.current) return;
     if (!contentId) {
       showToast('Run an audit before applying a correction.', 'error');
+      return;
+    }
+    if (savedText !== text) {
+      setIsAuditStale(true);
+      showToast('The source text changed. Run the audit again before applying this correction.', 'error');
       return;
     }
     const replacementOptions = Array.isArray(issue.replacement_options)
@@ -396,6 +827,7 @@ export default function ContentAnalyzer({
         brand_id: brandId,
         issue_ids: [selectedIssueId],
         content_version: currentVersion,
+        source_text: savedText,
       });
       if (!res.success) {
         if (
@@ -418,6 +850,7 @@ export default function ContentAnalyzer({
       setAuditedVersion(res.new_version);
       setIsAuditStale(false);
       setAnalysisResult(res.result);
+      onContentSaved?.(contentId);
       setSelectedReplacementOptions({});
       setStatus('pending_review');
       showToast(`Applied correction and saved version ${res.new_version}. Manual review is still required.`);
@@ -435,6 +868,15 @@ export default function ContentAnalyzer({
       showToast('Run an audit before applying corrections.', 'error');
       return;
     }
+    if (savedText !== text) {
+      setIsAuditStale(true);
+      showToast('The source text changed. Run the audit again before applying corrections.', 'error');
+      return;
+    }
+    if (rewritePreview && rewritePreview.type !== 'corrections') {
+      showToast('Save or discard the current preview before adopting all corrections.', 'error');
+      return;
+    }
 
     isApplyingFixRef.current = true;
     setIsApplyingFix(true);
@@ -444,6 +886,7 @@ export default function ContentAnalyzer({
         brand_id: brandId,
         apply_all: true,
         content_version: currentVersion,
+        source_text: savedText,
       });
       if (!res.success) {
         if (
@@ -453,24 +896,27 @@ export default function ContentAnalyzer({
         ) {
           setIsAuditStale(true);
         }
-        throw new Error(res.error || 'Corrections could not be saved.');
+        throw new Error(res.error || 'Could not prepare the corrections preview.');
       }
-      clearRewritePreview();
-      setText(res.applied_text);
-      setSavedText(res.applied_text);
+      setRewriteError('');
+      setRewritePreview({
+        type: 'corrections',
+        rewrittenText: res.applied_text,
+        source: {
+          brandId,
+          text: savedText,
+          contentType,
+          channel,
+          currentVersion,
+        },
+      });
+      setRevisionOriginalText(savedText);
       setRevisionText(res.applied_text);
-      setRevisionComplianceApproved(
-        res.correction_review?.compliant === true
-      );
-      setAnalysisResult(res.result);
-      setCurrentVersion(res.new_version);
-      setAuditedVersion(res.new_version);
-      setIsAuditStale(false);
-      setSelectedReplacementOptions({});
-      setStatus('pending_review');
-      showToast(`Applied all corrections (Updated to v${res.new_version}, Score: ${res.result.score}/100). Manual review is still required.`);
+      setRevisionComplianceApproved(false);
+      setActiveRightTab('diff');
+      showToast('Combined corrections are previewed here. Save as a new version to keep them.');
     } catch (err) {
-      showToast('Error applying corrections: ' + err.message, 'error');
+      showToast(err.message || 'Could not prepare the corrections preview.', 'error');
     } finally {
       isApplyingFixRef.current = false;
       setIsApplyingFix(false);
@@ -495,7 +941,11 @@ export default function ContentAnalyzer({
       if (!auditRes.success) throw new Error(auditRes.error || 'Failed to save content before recording review.');
       targetId = auditRes.content_id;
       targetVersion = auditRes.version;
+      if (!contentId) {
+        moveEditorDraftToContent(targetId, text);
+      }
       setContentId(targetId);
+      onContentSaved?.(targetId);
       setSavedText(text);
       setAnalysisResult(auditRes.result);
       setRevisionOriginalText(text);
@@ -533,6 +983,47 @@ export default function ContentAnalyzer({
     analysisResult
     && (isAuditStale || auditedVersion !== currentVersion)
   );
+
+  const handleDownloadPdfReport = async () => {
+    if (pdfDownloadRequestRef.current) return;
+    if (!contentId || !analysisResult) {
+      setPdfDownloadError('Run an audit and save its result before downloading a PDF report.');
+      return;
+    }
+    if (isAuditVersionStale || savedText !== text) {
+      setPdfDownloadError('The audit is stale. Run the audit again before downloading its report.');
+      return;
+    }
+
+    pdfDownloadRequestRef.current = true;
+    setIsDownloadingPdf(true);
+    setPdfDownloadError('');
+    let downloadUrl = null;
+    let downloadAnchor = null;
+    try {
+      const result = await api.downloadAuditReportPdf(contentId, brandId);
+      if (!result.success || !result.blob) {
+        throw new Error(result.error || 'Could not generate the PDF report.');
+      }
+
+      downloadUrl = URL.createObjectURL(result.blob);
+      downloadAnchor = document.createElement('a');
+      downloadAnchor.href = downloadUrl;
+      downloadAnchor.download = getAuditPdfFilename(brandName);
+      downloadAnchor.hidden = true;
+      document.body.appendChild(downloadAnchor);
+      downloadAnchor.click();
+    } catch (error) {
+      setPdfDownloadError(error.message || 'Could not generate the PDF report.');
+    } finally {
+      downloadAnchor?.remove();
+      if (downloadUrl) {
+        window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+      }
+      pdfDownloadRequestRef.current = false;
+      setIsDownloadingPdf(false);
+    }
+  };
 
   const categories = ['ALL', 'Terminology', 'Fact Accuracy', 'Voice & Tone', 'Compliance & Claims', 'Accessibility & Clarity'];
 
@@ -682,8 +1173,16 @@ export default function ContentAnalyzer({
             <textarea
               value={text}
               onChange={(e) => {
+                const nextText = e.target.value;
+                if (brandId) {
+                  pendingEditorDraftRef.current = {
+                    brandId,
+                    contentId: contentToEdit?.id ?? contentId ?? null,
+                    text: nextText,
+                  };
+                }
                 clearRewritePreview();
-                setText(e.target.value);
+                setText(nextText);
                 setAnalysisResult(null);
                 clearRevision();
                 setSelectedReplacementOptions({});
@@ -718,7 +1217,10 @@ export default function ContentAnalyzer({
 
               {contentToEdit && onCancelEdit && (
                 <button
-                  onClick={onCancelEdit}
+                  onClick={() => {
+                    clearEditorDraft();
+                    onCancelEdit();
+                  }}
                   disabled={isAnalyzing}
                   className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
                   title="Discard unsaved edits and return to Review History"
@@ -775,7 +1277,11 @@ export default function ContentAnalyzer({
                 <div>
                   <h3 className="text-xs font-bold text-slate-900">AI Rewrite Preview</h3>
                   <p className="mt-1 text-[11px] text-slate-600">
-                    Gemini-generated preview. Your original content remains unchanged until you save.
+                    {rewritePreview.type === 'manual'
+                      ? 'Manually reviewed correction preview. The original remains unchanged and this is not compliance approval.'
+                      : rewritePreview.type === 'corrections'
+                        ? 'Validated automatic corrections preview. The original remains unchanged until you save.'
+                        : 'Gemini-generated preview. Your original content remains unchanged until you save.'}
                   </p>
                 </div>
                 <div className="flex items-center gap-2 shrink-0">
@@ -880,14 +1386,40 @@ export default function ContentAnalyzer({
             <div>
               {/* Compliance Score Header */}
               <div className="pb-4 border-b border-slate-100">
-                <div className="flex items-center justify-between mb-3">
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
                   <span className="text-xs font-bold uppercase tracking-wider text-slate-500">
                     Compliance Health
                   </span>
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-100 text-slate-600">
-                    {analysisResult.engine_used === 'AI_GEMINI' ? 'Gemini AI' : 'Rule-Based Fallback'}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-slate-100 text-slate-600">
+                      {analysisResult.engine_used === 'AI_GEMINI' ? 'Gemini AI' : 'Rule-Based Fallback'}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={handleDownloadPdfReport}
+                      disabled={
+                        isDownloadingPdf
+                        || !contentId
+                        || isAuditVersionStale
+                        || savedText !== text
+                      }
+                      className="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-600 px-3 py-1.5 text-[11px] font-semibold text-white transition-colors hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      <span>
+                        {isDownloadingPdf ? 'Generating PDF…' : 'Download PDF Report'}
+                      </span>
+                    </button>
+                  </div>
                 </div>
+                {pdfDownloadError && (
+                  <p
+                    role="alert"
+                    className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700"
+                  >
+                    {pdfDownloadError}
+                  </p>
+                )}
 
                 <RiskScoreBadge
                   score={analysisResult.score}
@@ -981,6 +1513,20 @@ export default function ContentAnalyzer({
                           selectedReplacementOptionId={selectedReplacementOptions[issue.id]}
                           onReplacementOptionChange={handleReplacementOptionChange}
                           onApplyFix={handleApplySingleFix}
+                          onManualCorrection={handleApproveManualCorrection}
+                          onOpenManualEditor={handleOpenManualEditor}
+                          onCancelManualEditor={handleCancelManualEditor}
+                          onManualReplacementChange={handleManualReplacementChange}
+                          manualEditorOpen={manualCorrectionForms[issue.id]?.open === true}
+                          manualReplacement={
+                            manualCorrectionForms[issue.id]?.replacementText || ''
+                          }
+                          manualCorrectionError={
+                            manualCorrectionForms[issue.id]?.error || ''
+                          }
+                          isApprovingManualCorrection={
+                            manualCorrectionForms[issue.id]?.isApproving === true
+                          }
                           isApplyingFix={isApplyingFix}
                         />
                       ))

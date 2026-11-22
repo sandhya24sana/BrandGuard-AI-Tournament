@@ -224,6 +224,127 @@ test('ReviewHistory shows API failures instead of stale or empty results', async
   assert.equal(container.querySelector('[role="alert"]')?.textContent, 'History unavailable');
 });
 
+test('ReviewHistory reopens saved content with its persisted audit result', async (context) => {
+  const { React, act, Component, container, root } = await createComponentHarness(
+    context,
+    '/src/pages/ReviewHistory.jsx',
+  );
+  const content = {
+    ...contentItem(55, 'Saved audit content'),
+    brand_id: 7,
+    original_text: 'Persisted source text.',
+  };
+  const analysis = {
+    version_number: 1,
+    issues: [{ id: 'persisted-issue', rule: 'Persisted finding' }],
+  };
+  const editedContent = [];
+  globalThis.fetch = async (url) => {
+    const requestUrl = String(url);
+    if (requestUrl.includes('/api/content?')) {
+      return response({ success: true, items: [content] });
+    }
+    if (requestUrl.includes('/api/content/55?')) {
+      return response({
+        success: true,
+        content,
+        latest_analysis: analysis,
+        versions: [],
+        reviews: [],
+      });
+    }
+    return response({ success: false, error: 'Unexpected request' }, 404);
+  };
+
+  await act(async () => {
+    root.render(React.createElement(Component, {
+      brandId: 7,
+      onEditContent: (value) => editedContent.push(value),
+    }));
+    await flush();
+  });
+  await act(async () => {
+    container.querySelector('[title="Edit and resubmit as a new version"]').click();
+    await flush();
+  });
+
+  assert.equal(editedContent.length, 1);
+  assert.equal(editedContent[0].id, 55);
+  assert.deepEqual(editedContent[0].latest_analysis, analysis);
+});
+
+test('ReviewHistory preserves JSON export and downloads its brand-scoped PDF', async (context) => {
+  const { React, act, Component, container, root, window } = await createComponentHarness(
+    context,
+    '/src/pages/ReviewHistory.jsx',
+  );
+  const originalCreateObjectURL = URL.createObjectURL;
+  const originalRevokeObjectURL = URL.revokeObjectURL;
+  const originalAnchorClick = window.HTMLAnchorElement.prototype.click;
+  let downloadedFilename = '';
+  const requests = [];
+  URL.createObjectURL = () => 'blob:history-report';
+  URL.revokeObjectURL = () => {};
+  window.HTMLAnchorElement.prototype.click = function click() {
+    downloadedFilename = this.download;
+  };
+  context.after(() => {
+    URL.createObjectURL = originalCreateObjectURL;
+    URL.revokeObjectURL = originalRevokeObjectURL;
+    window.HTMLAnchorElement.prototype.click = originalAnchorClick;
+  });
+  globalThis.fetch = async (url) => {
+    const requestUrl = String(url);
+    requests.push(requestUrl);
+    if (requestUrl.includes('/api/content?')) {
+      return response({ success: true, items: [contentItem(55, 'Saved PDF Content')] });
+    }
+    if (requestUrl.includes('/api/content/55?')) {
+      return response({
+        success: true,
+        content: {
+          ...contentItem(55, 'Saved PDF Content'),
+          brand_id: 7,
+          brand_name: 'Northstar Co',
+          original_text: 'Saved PDF source.',
+        },
+        latest_analysis: { version_number: 1, issues: [] },
+        versions: [],
+        reviews: [],
+      });
+    }
+    return new Response(new Blob(['%PDF-1.4 history report'], {
+      type: 'application/pdf',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/pdf' },
+    });
+  };
+
+  await act(async () => {
+    root.render(React.createElement(Component, { brandId: 7 }));
+    await flush();
+  });
+  await act(async () => {
+    container.querySelector('[title="View Revisions & Decision Trail"]').click();
+    await flush();
+  });
+  assert.ok(Array.from(container.querySelectorAll('button'))
+    .some((button) => button.textContent.includes('Export JSON Record')));
+  const pdfButton = Array.from(container.querySelectorAll('button'))
+    .find((button) => button.textContent.includes('Download PDF Report'));
+  assert.ok(pdfButton);
+
+  await act(async () => {
+    pdfButton.click();
+    await flush();
+  });
+
+  assert.ok(requests.some((url) =>
+    url.endsWith('/api/history/export/55/pdf?brand_id=7')));
+  assert.equal(downloadedFilename, 'BrandGuard_Audit_Report_Northstar_Co.pdf');
+});
+
 test('ReviewHistory compares any two saved versions with their numbers and timestamps', async (context) => {
   const { React, act, Component, container, root, window } = await createComponentHarness(
     context,
@@ -490,6 +611,260 @@ test('ContentAnalyzer records a review against the version created during submis
   await act(async () => {
     await new Promise((resolve) => setTimeout(resolve, 3600));
   });
+});
+
+test('App restores the saved brand, content, and audit after a page reload', async (context) => {
+  const { React, act, Component, container, root, window } = await createComponentHarness(
+    context,
+    '/src/App.jsx',
+  );
+  window.localStorage.setItem('brandguard.ui-state.v1', JSON.stringify({
+    currentTab: 'analyzer',
+    selectedBrandId: 7,
+    activeContentId: 55,
+    auditIdToInspect: null,
+  }));
+  const savedContent = {
+    id: 55,
+    brand_id: 7,
+    title: 'Saved GreenLeaf Copy',
+    content_type: 'Ad Copy',
+    channel: 'Digital',
+    original_text: 'Previously saved source copy.',
+    corrected_text: 'Previously saved source copy.',
+    current_version: 2,
+    status: 'pending_review',
+  };
+  const savedIssue = {
+    id: 'saved-issue',
+    category: 'Terminology',
+    severity: 'WARNING',
+    rule: 'Saved audit issue',
+    matched_text: 'source',
+    suggestion: 'Review this terminology.',
+    auto_fixable: false,
+    manual_review_required: true,
+    location: { start: 18, end: 24 },
+  };
+  const requests = [];
+  globalThis.fetch = async (url) => {
+    const requestUrl = String(url);
+    requests.push(requestUrl);
+    if (requestUrl.endsWith('/api/brands')) {
+      return response({ success: true, brands: [{ id: 7, name: 'GreenLeaf' }] });
+    }
+    if (requestUrl.endsWith('/api/analysis/system-status')) {
+      return response({ success: true, ai_configured: false, mode: 'Rule-Based Fallback' });
+    }
+    if (requestUrl.startsWith('/api/content/55')) {
+      return response({
+        success: true,
+        content: savedContent,
+        latest_analysis: {
+          version_number: 2,
+          score: 82,
+          risk_level: 'WARNING',
+          sub_scores: {},
+          issues: [savedIssue],
+          summary: 'Saved audit result.',
+          corrected_text: savedContent.original_text,
+        },
+        versions: [
+          { id: 1, version_number: 1, text: 'Previous version.' },
+          { id: 2, version_number: 2, text: savedContent.original_text },
+        ],
+        reviews: [],
+      });
+    }
+    if (requestUrl.includes('/api/analysis/manual-corrections/55?')) {
+      return response({
+        success: true,
+        preview_state: { correction_count: 0 },
+      });
+    }
+    return response({ success: false, error: 'Unexpected request' }, 404);
+  };
+
+  await act(async () => {
+    root.render(React.createElement(Component));
+    await flush();
+    await flush();
+  });
+
+  assert.ok(requests.some((url) => url.startsWith('/api/content/55')));
+  assert.equal(container.querySelector('textarea')?.value, savedContent.original_text);
+  assert.match(container.textContent, /Saved audit issue/);
+  assert.match(container.textContent, /\(v2\)/);
+  assert.deepEqual(
+    JSON.parse(window.localStorage.getItem('brandguard.ui-state.v1')),
+    {
+      currentTab: 'analyzer',
+      selectedBrandId: 7,
+      activeContentId: 55,
+      auditIdToInspect: null,
+    },
+  );
+});
+
+test('ContentAnalyzer downloads one brand-scoped PDF and shows its loading state', async (context) => {
+  const { React, act, Component, container, root, window } = await createComponentHarness(
+    context,
+    '/src/pages/ContentAnalyzer.jsx',
+  );
+  const originalCreateObjectURL = URL.createObjectURL;
+  const originalRevokeObjectURL = URL.revokeObjectURL;
+  const originalAnchorClick = window.HTMLAnchorElement.prototype.click;
+  const downloads = [];
+  const requests = [];
+  let resolvePdfResponse;
+  URL.createObjectURL = () => 'blob:brandguard-audit-report';
+  URL.revokeObjectURL = () => {};
+  window.HTMLAnchorElement.prototype.click = function click() {
+    downloads.push({
+      filename: this.download,
+      href: this.href,
+    });
+  };
+  context.after(() => {
+    URL.createObjectURL = originalCreateObjectURL;
+    URL.revokeObjectURL = originalRevokeObjectURL;
+    window.HTMLAnchorElement.prototype.click = originalAnchorClick;
+  });
+  globalThis.fetch = async (url) => {
+    const requestUrl = String(url);
+    requests.push(requestUrl);
+    if (requestUrl.includes('/api/analysis/manual-corrections/55?')) {
+      return response({ success: true, preview_state: { correction_count: 0 } });
+    }
+    return new Promise((resolve) => {
+      resolvePdfResponse = resolve;
+    });
+  };
+
+  await act(async () => {
+    root.render(React.createElement(Component, {
+      brandId: 7,
+      brandName: 'Northstar Co',
+      contentToEdit: {
+        id: 55,
+        brand_id: 7,
+        title: 'Saved report content',
+        content_type: 'Ad Copy',
+        channel: 'Digital',
+        original_text: 'Saved source text.',
+        current_version: 3,
+        latest_analysis: {
+          version_number: 3,
+          score: 88,
+          risk_level: 'MODERATE',
+          sub_scores: {
+            facts: 90,
+            claims: 88,
+            terminology: 90,
+            tone: 85,
+            accessibility: 88,
+          },
+          issues: [],
+          summary: 'Stored audit assessment.',
+          corrected_text: 'Saved source text.',
+        },
+      },
+    }));
+    await flush();
+    await flush();
+  });
+
+  const downloadButton = Array.from(container.querySelectorAll('button'))
+    .find((button) => button.textContent.includes('Download PDF Report'));
+  assert.ok(downloadButton);
+  assert.equal(downloadButton.disabled, false);
+
+  await act(async () => {
+    downloadButton.click();
+    await flush();
+  });
+  assert.match(downloadButton.textContent, /Generating PDF/);
+  await act(async () => {
+    downloadButton.click();
+    await flush();
+  });
+  assert.equal(
+    requests.filter((url) => url.includes('/history/export/55/pdf?')).length,
+    1,
+  );
+
+  await act(async () => {
+    resolvePdfResponse(new Response(new Blob(['%PDF-1.4 real report bytes'], {
+      type: 'application/pdf',
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/pdf' },
+    }));
+    await flush();
+    await flush();
+  });
+
+  assert.equal(downloads.length, 1);
+  assert.equal(downloads[0].filename, 'BrandGuard_Audit_Report_Northstar_Co.pdf');
+  assert.equal(downloads[0].href, 'blob:brandguard-audit-report');
+  assert.match(downloadButton.textContent, /Download PDF Report/);
+});
+
+test('ContentAnalyzer displays PDF generation failures', async (context) => {
+  const { React, act, Component, container, root } = await createComponentHarness(
+    context,
+    '/src/pages/ContentAnalyzer.jsx',
+  );
+  globalThis.fetch = async (url) => {
+    if (String(url).includes('/api/analysis/manual-corrections/55?')) {
+      return response({ success: true, preview_state: { correction_count: 0 } });
+    }
+    return response({
+      success: false,
+      error: 'The current audit is unavailable.',
+    }, 404);
+  };
+
+  await act(async () => {
+    root.render(React.createElement(Component, {
+      brandId: 7,
+      brandName: 'Northstar Co',
+      contentToEdit: {
+        id: 55,
+        brand_id: 7,
+        original_text: 'Saved source text.',
+        current_version: 1,
+        latest_analysis: {
+          version_number: 1,
+          score: 100,
+          risk_level: 'LOW',
+          sub_scores: {
+            facts: 100,
+            claims: 100,
+            terminology: 100,
+            tone: 100,
+            accessibility: 100,
+          },
+          issues: [],
+          summary: 'No configured issues.',
+          corrected_text: 'Saved source text.',
+        },
+      },
+    }));
+    await flush();
+    await flush();
+  });
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Download PDF Report'))
+      .click();
+    await flush();
+  });
+
+  assert.equal(
+    container.querySelector('[role="alert"]')?.textContent,
+    'The current audit is unavailable.',
+  );
 });
 
 test('ContentAnalyzer preserves original copy and shows only the saved revision status', async (context) => {
@@ -952,6 +1327,7 @@ test('ContentAnalyzer sends one selected issue and its audited version for indiv
     brand_id: 7,
     issue_ids: ['second'],
     content_version: 5,
+    source_text: sourceText,
   });
   assert.equal(contentDetailReads, 2);
   assert.equal(container.textContent.includes('alpha two'), true);
@@ -1136,6 +1512,351 @@ test('ContentAnalyzer shows AI rewrite loading and error states', async (context
   });
   assert.equal(container.querySelector('[role="alert"]')?.textContent, 'Gemini rewrite is unavailable.');
   assert.match(container.textContent, /AI Rewrite/);
+});
+
+test('ContentAnalyzer approves manual edits into the preview and saves only as a new version', async (context) => {
+  const { React, act, Component, container, root, window } = await createComponentHarness(
+    context,
+    '/src/pages/ContentAnalyzer.jsx',
+  );
+  const sourceText = 'Our product cures diseases.';
+  const correctedText = 'Our product supports healthy habits.';
+  const issue = {
+    id: 'manual-medical-claim',
+    category: 'Compliance & Claims',
+    severity: 'CRITICAL',
+    rule: 'Unsupported Medical Claims',
+    matched_text: 'cures diseases',
+    suggestion: 'supports wellness',
+    replacement_text: null,
+    explanation: 'Medical claims require human review.',
+    auto_fixable: false,
+    manual_review_required: true,
+    location: { start: 12, end: 26 },
+  };
+  const calls = [];
+  let auditCount = 0;
+  let persistedText = sourceText;
+  let persistedVersion = 0;
+  window.confirm = () => true;
+  globalThis.fetch = async (url, options = {}) => {
+    const request = {
+      url: String(url),
+      method: options.method || 'GET',
+      body: options.body ? JSON.parse(options.body) : null,
+    };
+    calls.push(request);
+    if (request.url.endsWith('/api/analysis/audit')) {
+      auditCount += 1;
+      persistedText = request.body.text;
+      persistedVersion = auditCount;
+      return response({
+        success: true,
+        content_id: 71,
+        version: persistedVersion,
+        status: 'pending_review',
+        result: {
+          score: 60,
+          risk_level: 'CRITICAL',
+          sub_scores: {},
+          issues: auditCount === 1 ? [issue] : [],
+          summary: 'Manual review is required.',
+          corrected_text: request.body.text,
+          engine_used: 'RULE_BASED_FALLBACK',
+          readability: {
+            reading_ease: 70,
+            grade_level: 6,
+            sentence_count: 1,
+            reading_time_sec: 1,
+          },
+        },
+      });
+    }
+    if (request.url.includes('/api/content/71?')) {
+      return response({
+        success: true,
+        content: {
+          id: 71,
+          brand_id: 7,
+          current_version: persistedVersion,
+          original_text: persistedText,
+        },
+        versions: [{ id: 501, version_number: persistedVersion }],
+      });
+    }
+    if (request.url.endsWith('/api/analysis/manual-corrections')) {
+      return response({
+        success: true,
+        content_id: 71,
+        current_version_id: 501,
+        preview_state: {
+          corrected_text: correctedText,
+          correction_count: 1,
+          manual_review_required: true,
+          compliance_approved: false,
+        },
+      });
+    }
+    if (request.url.includes('/api/analysis/manual-corrections/71')) {
+      return response({ success: true });
+    }
+    return response({ success: false, error: 'Unexpected request' }, 404);
+  };
+
+  await act(async () => {
+    root.render(React.createElement(Component, {
+      brandId: 7,
+      brandName: 'Manual Review Test Brand',
+    }));
+    await flush();
+  });
+  const contentEditor = container.querySelector('textarea');
+  const valueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype,
+    'value',
+  ).set;
+  await act(async () => {
+    valueSetter.call(contentEditor, sourceText);
+    contentEditor.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await flush();
+  });
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Audit Content'))
+      .click();
+    await flush();
+  });
+
+  assert.ok(Array.from(container.querySelectorAll('button'))
+    .some((button) => button.textContent.includes('Review & Edit')));
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Review & Edit'))
+      .click();
+    await flush();
+  });
+  const emptyCorrectionEditor = container.querySelector(
+    'textarea[aria-label="Your correction"]',
+  );
+  await act(async () => {
+    valueSetter.call(emptyCorrectionEditor, '');
+    emptyCorrectionEditor.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await flush();
+  });
+  assert.equal(
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Approve Correction')).disabled,
+    true,
+  );
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.trim() === 'Cancel')
+      .click();
+    await flush();
+  });
+  assert.equal(
+    calls.some((call) => call.url.endsWith('/api/analysis/manual-corrections')),
+    false,
+  );
+
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Review & Edit'))
+      .click();
+    await flush();
+  });
+  const correctionEditor = container.querySelector(
+    'textarea[aria-label="Your correction"]',
+  );
+  await act(async () => {
+    valueSetter.call(correctionEditor, 'supports healthy habits');
+    correctionEditor.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await flush();
+  });
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Approve Correction'))
+      .click();
+    await flush();
+  });
+
+  const correctionCall = calls.find((call) =>
+    call.url.endsWith('/api/analysis/manual-corrections'));
+  assert.deepEqual(correctionCall.body, {
+    content_id: 71,
+    brand_id: 7,
+    current_version_id: 501,
+    issue_id: issue.id,
+    original_text: issue.matched_text,
+    replacement_text: 'supports healthy habits',
+    source_text: sourceText,
+    source_start: 12,
+    source_end: 26,
+  });
+  assert.equal(persistedText, sourceText);
+  assert.equal(persistedVersion, 1);
+  assert.equal(container.querySelector('textarea').value, sourceText);
+  assert.match(container.textContent, /Our product supports healthy habits\./);
+  assert.match(container.textContent, /not compliance-approved or saved yet/i);
+  assert.equal(auditCount, 1);
+
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Save as New Version'))
+      .click();
+    await flush();
+  });
+  const saveCall = calls.filter((call) =>
+    call.url.endsWith('/api/analysis/audit'))[1];
+  assert.equal(saveCall.body.content_id, 71);
+  assert.equal(saveCall.body.current_version, 1);
+  assert.equal(saveCall.body.text, correctedText);
+  assert.equal(persistedText, correctedText);
+  assert.equal(persistedVersion, 2);
+  assert.equal(container.querySelector('textarea').value, correctedText);
+  assert.equal(auditCount, 2);
+  assert.ok(calls.some((call) => (
+    call.url.includes('/api/analysis/manual-corrections/71')
+    && call.method === 'DELETE'
+  )));
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 3600));
+  });
+});
+
+test('ContentAnalyzer rejects manual approval when the audited version is stale', async (context) => {
+  const { React, act, Component, container, root, window } = await createComponentHarness(
+    context,
+    '/src/pages/ContentAnalyzer.jsx',
+  );
+  const sourceText = 'Our product cures diseases.';
+  const issue = {
+    id: 'manual-medical-claim',
+    category: 'Compliance & Claims',
+    severity: 'CRITICAL',
+    rule: 'Unsupported Medical Claims',
+    matched_text: 'cures diseases',
+    suggestion: 'supports wellness',
+    auto_fixable: false,
+    manual_review_required: true,
+    location: { start: 12, end: 26 },
+  };
+  const calls = [];
+  let contentDetailReads = 0;
+  globalThis.fetch = async (url, options = {}) => {
+    const request = {
+      url: String(url),
+      method: options.method || 'GET',
+      body: options.body ? JSON.parse(options.body) : null,
+    };
+    calls.push(request);
+    if (request.url.includes('/api/analysis/manual-corrections/71')) {
+      return response({
+        success: true,
+        current_version_id: 501,
+        preview_state: {
+          corrected_text: sourceText,
+          correction_count: 0,
+          corrections: [],
+        },
+      });
+    }
+    if (request.url.includes('/api/content/71?')) {
+      contentDetailReads += 1;
+      return response({
+        success: true,
+        content: {
+          id: 71,
+          brand_id: 7,
+          current_version: contentDetailReads === 1 ? 1 : 3,
+        },
+      });
+    }
+    if (request.url.endsWith('/api/analysis/audit')) {
+      return response({
+        success: true,
+        content_id: 71,
+        version: 2,
+        status: 'pending_review',
+        result: {
+          score: 60,
+          risk_level: 'CRITICAL',
+          sub_scores: {},
+          issues: [issue],
+          summary: 'Manual review is required.',
+          corrected_text: sourceText,
+          engine_used: 'RULE_BASED_FALLBACK',
+          readability: {
+            reading_ease: 70,
+            grade_level: 6,
+            sentence_count: 1,
+            reading_time_sec: 1,
+          },
+        },
+      });
+    }
+    return response({ success: false, error: 'Unexpected request' }, 404);
+  };
+
+  await act(async () => {
+    root.render(React.createElement(Component, {
+      brandId: 7,
+      brandName: 'Manual Review Test Brand',
+      contentToEdit: {
+        id: 71,
+        title: 'Stale manual correction',
+        content_type: 'Ad Copy',
+        channel: 'Website',
+        original_text: sourceText,
+        current_version: 1,
+      },
+    }));
+    await flush();
+  });
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Audit Content'))
+      .click();
+    await flush();
+  });
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Review & Edit'))
+      .click();
+    await flush();
+  });
+  const correctionEditor = container.querySelector(
+    'textarea[aria-label="Your correction"]',
+  );
+  const valueSetter = Object.getOwnPropertyDescriptor(
+    window.HTMLTextAreaElement.prototype,
+    'value',
+  ).set;
+  await act(async () => {
+    valueSetter.call(correctionEditor, 'supports wellness');
+    correctionEditor.dispatchEvent(new window.Event('input', { bubbles: true }));
+    await flush();
+  });
+  await act(async () => {
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Approve Correction'))
+      .click();
+    await flush();
+  });
+
+  assert.equal(
+    calls.some((call) => call.url.endsWith('/api/analysis/manual-corrections')),
+    false,
+  );
+  assert.match(container.textContent, /audited content version is stale/i);
+  assert.equal(
+    Array.from(container.querySelectorAll('button'))
+      .find((button) => button.textContent.includes('Approve Correction')).disabled,
+    true,
+  );
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 3600));
+  });
 });
 
 test('App reports brand-load failures instead of showing an empty-brand state', async (context) => {

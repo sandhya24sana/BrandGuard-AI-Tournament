@@ -12,3 +12,5 @@ node_modules/
 dist/
 *.log
 backend/*.db
+*.db-shm
+*.db-wal

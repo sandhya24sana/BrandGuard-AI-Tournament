@@ -40,7 +40,8 @@ async function safeFetch(url, options = {}) {
         status: res.status,
         ...(data?.current_version !== undefined
           ? { current_version: data.current_version }
-          : {})
+          : {}),
+        ...(data?.stale === true ? { stale: true } : {}),
       };
     }
 
@@ -49,6 +50,44 @@ async function safeFetch(url, options = {}) {
     return {
       success: false,
       error: err.message || 'Network communication error'
+    };
+  }
+}
+
+async function safeFetchPdf(url) {
+  try {
+    const res = await fetch(url);
+    const contentType = (res.headers.get('content-type') || '').toLowerCase();
+    if (!res.ok) {
+      if (contentType.includes('application/json')) {
+        const data = await res.json();
+        return {
+          success: false,
+          error: data?.error || `Server returned error status HTTP ${res.status}`,
+          status: res.status,
+        };
+      }
+      return {
+        success: false,
+        error: `PDF report request failed with HTTP ${res.status}.`,
+        status: res.status,
+      };
+    }
+    if (!contentType.includes('application/pdf')) {
+      return {
+        success: false,
+        error: 'The server did not return a PDF report.',
+      };
+    }
+    const blob = await res.blob();
+    if (blob.size === 0) {
+      return { success: false, error: 'The server returned an empty PDF report.' };
+    }
+    return { success: true, blob };
+  } catch (error) {
+    return {
+      success: false,
+      error: error.message || 'Network communication error',
     };
   }
 }
@@ -266,6 +305,43 @@ export const api = {
     });
   },
 
+  approveManualCorrection: async (correctionRequest) => {
+    return safeFetch(`${API_BASE}/analysis/manual-corrections`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(correctionRequest)
+    });
+  },
+
+  getManualCorrectionPreview: async (contentId, brandId) => {
+    if (!contentId || !brandId) {
+      return {
+        success: false,
+        error: 'Content ID and brand ID are required to load manual corrections.'
+      };
+    }
+    return safeFetch(
+      `${API_BASE}/analysis/manual-corrections/${contentId}?brand_id=${encodeURIComponent(brandId)}`
+    );
+  },
+
+  discardManualCorrections: async (contentId, brandId, currentVersionId) => {
+    if (!contentId || !brandId || !currentVersionId) {
+      return {
+        success: false,
+        error: 'Content, brand, and version IDs are required to discard manual corrections.'
+      };
+    }
+    const query = new URLSearchParams({
+      brand_id: String(brandId),
+      current_version_id: String(currentVersionId),
+    });
+    return safeFetch(
+      `${API_BASE}/analysis/manual-corrections/${contentId}?${query}`,
+      { method: 'DELETE' }
+    );
+  },
+
   // Reviews
   submitReview: async (data) => {
     return safeFetch(`${API_BASE}/reviews`, {
@@ -299,5 +375,22 @@ export const api = {
       ? `${API_BASE}/history/export/${contentId}?brand_id=${encodeURIComponent(brandId)}`
       : `${API_BASE}/history/export/${contentId}`;
     return safeFetch(url);
+  },
+
+  downloadAuditReportPdf: async (contentId, brandId) => {
+    if (
+      !Number.isSafeInteger(contentId)
+      || contentId < 1
+      || !Number.isSafeInteger(brandId)
+      || brandId < 1
+    ) {
+      return {
+        success: false,
+        error: 'A valid content ID and brand ID are required to download the PDF report.',
+      };
+    }
+    return safeFetchPdf(
+      `${API_BASE}/history/export/${contentId}/pdf?brand_id=${encodeURIComponent(brandId)}`,
+    );
   }
 };

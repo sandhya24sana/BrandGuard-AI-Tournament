@@ -464,6 +464,66 @@ class CorrectionEngineTests(unittest.TestCase):
         self.assertEqual(repeated["applied_issue_ids"], [])
         self.assertCountEqual(repeated["manual_review"], ["cure", "prevent"])
 
+    def test_single_word_claim_replacements_require_grammar_review(self):
+        source = "Our products cure."
+        issue = {
+            "id": "claim-cure",
+            "category": "Compliance & Claims",
+            "rule": "Unsupported Medical Claims",
+            "matched_text": "cure",
+            "replacement_text": "support",
+            "auto_fixable": True,
+            "location": {"start": 13, "end": 17},
+        }
+
+        attach_replacement_options(source, [issue])
+
+        self.assertFalse(issue["auto_fixable"])
+        self.assertTrue(issue["manual_review_required"])
+        self.assertIn("sentence grammar", issue["manual_review_reason"])
+        result = apply_corrections(source, [issue])
+        self.assertEqual(result["text"], source)
+        self.assertEqual(result["applied_issue_ids"], [])
+
+    def test_overlapping_sentence_claim_and_phrase_replacements_require_review(self):
+        source = "Our product can cure diseases."
+        cure_start = source.index("cure diseases")
+        product_start = source.index("product")
+        issues = [
+            {
+                "id": "medical-claim",
+                "category": "Compliance & Claims",
+                "rule": "Unsupported Medical Claims",
+                "matched_text": "cure diseases",
+                "replacement_text": "Enjoy food made with natural ingredients.",
+                "auto_fixable": True,
+                "location": {
+                    "start": cure_start,
+                    "end": cure_start + len("cure diseases"),
+                },
+            },
+            {
+                "id": "terminology",
+                "category": "Terminology",
+                "matched_text": "product",
+                "replacement_text": "item",
+                "auto_fixable": True,
+                "location": {
+                    "start": product_start,
+                    "end": product_start + len("product"),
+                },
+            },
+        ]
+
+        attach_replacement_options(source, issues)
+
+        self.assertTrue(all(not issue["auto_fixable"] for issue in issues))
+        self.assertTrue(all(issue["manual_review_required"] for issue in issues))
+        self.assertTrue(all(
+            "Overlapping correction spans" in issue["manual_review_reason"]
+            for issue in issues
+        ))
+
 
 class CorrectionWorkflowAPITests(unittest.TestCase):
     def setUp(self):
@@ -495,6 +555,295 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def create_manual_claim(self, rule_name, pattern):
+        response = self.client.post(
+            f"/api/brands/{self.brand_id}/claims",
+            json={
+                "rule_name": rule_name,
+                "pattern_or_trigger": pattern,
+                "explanation": "This claim requires human review.",
+                "severity": "critical",
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+
+    def audit_manual_source(self, source_text):
+        audit_response = self.client.post("/api/analysis/audit", json={
+            "brand_id": self.brand_id,
+            "title": "Manual correction workflow",
+            "text": source_text,
+        })
+        self.assertEqual(
+            audit_response.status_code, 200, audit_response.get_json()
+        )
+        audit = audit_response.get_json()
+        content = self.client.get(
+            f"/api/content/{audit['content_id']}?brand_id={self.brand_id}"
+        ).get_json()
+        return audit, content["versions"][0]["id"]
+
+    def manual_correction_payload(
+        self, audit, version_id, issue, replacement_text, source_text,
+    ):
+        return {
+            "content_id": audit["content_id"],
+            "brand_id": self.brand_id,
+            "current_version_id": version_id,
+            "issue_id": issue["id"],
+            "original_text": issue["matched_text"],
+            "replacement_text": replacement_text,
+            "source_text": source_text,
+            "source_start": issue["location"]["start"],
+            "source_end": issue["location"]["end"],
+        }
+
+    def test_manual_corrections_are_persisted_in_preview_without_saving_a_version(self):
+        self.create_manual_claim("Manual cure claim", r"\bcures diseases\b")
+        self.create_manual_claim("Manual illness claim", r"\bprevents illness\b")
+        source_text = "Our product cures diseases and prevents illness."
+        audit, version_id = self.audit_manual_source(source_text)
+        issues = {
+            issue["rule"]: issue
+            for issue in audit["result"]["issues"]
+            if issue["rule"] in {
+                "Manual cure claim",
+                "Manual illness claim",
+            }
+        }
+        self.assertEqual(len(issues), 2)
+        for issue in issues.values():
+            self.assertFalse(issue["auto_fixable"])
+            self.assertTrue(issue["manual_review_required"])
+
+        first = self.client.post("/api/analysis/manual-corrections", json=(
+            self.manual_correction_payload(
+                audit,
+                version_id,
+                issues["Manual cure claim"],
+                "supports healthy habits",
+                source_text,
+            )
+        ))
+        self.assertEqual(first.status_code, 200, first.get_json())
+        self.assertEqual(
+            first.get_json()["preview_state"]["corrected_text"],
+            "Our product supports healthy habits and prevents illness.",
+        )
+        self.assertTrue(first.get_json()["preview_state"]["manual_review_required"])
+        self.assertFalse(first.get_json()["preview_state"]["compliance_approved"])
+
+        second = self.client.post("/api/analysis/manual-corrections", json=(
+            self.manual_correction_payload(
+                audit,
+                version_id,
+                issues["Manual illness claim"],
+                "supports wellness",
+                source_text,
+            )
+        ))
+        self.assertEqual(second.status_code, 200, second.get_json())
+        expected_preview = (
+            "Our product supports healthy habits and supports wellness."
+        )
+        self.assertEqual(
+            second.get_json()["preview_state"]["corrected_text"],
+            expected_preview,
+        )
+
+        content = self.client.get(
+            f"/api/content/{audit['content_id']}?brand_id={self.brand_id}"
+        ).get_json()
+        self.assertEqual(content["content"]["original_text"], source_text)
+        self.assertEqual(content["content"]["current_version"], audit["version"])
+        self.assertEqual(len(content["versions"]), 1)
+
+        restored = self.client.get(
+            f"/api/analysis/manual-corrections/{audit['content_id']}?brand_id={self.brand_id}"
+        )
+        self.assertEqual(restored.status_code, 200, restored.get_json())
+        self.assertEqual(
+            restored.get_json()["preview_state"]["corrected_text"],
+            expected_preview,
+        )
+        self.assertEqual(restored.get_json()["preview_state"]["correction_count"], 2)
+
+        updated_payload = self.manual_correction_payload(
+            audit,
+            version_id,
+            issues["Manual cure claim"],
+            "encourages balanced choices",
+            source_text,
+        )
+        updated = self.client.post(
+            "/api/analysis/manual-corrections", json=updated_payload
+        )
+        self.assertEqual(updated.status_code, 200, updated.get_json())
+        self.assertEqual(
+            updated.get_json()["preview_state"]["correction_count"], 2
+        )
+        self.assertEqual(
+            updated.get_json()["preview_state"]["corrected_text"],
+            "Our product encourages balanced choices and supports wellness.",
+        )
+
+        saved = self.client.post("/api/analysis/audit", json={
+            "content_id": audit["content_id"],
+            "current_version": audit["version"],
+            "brand_id": self.brand_id,
+            "title": "Manual correction workflow",
+            "text": updated.get_json()["preview_state"]["corrected_text"],
+        })
+        self.assertEqual(saved.status_code, 200, saved.get_json())
+        saved_content = self.client.get(
+            f"/api/content/{audit['content_id']}?brand_id={self.brand_id}"
+        ).get_json()
+        self.assertEqual(saved_content["content"]["current_version"], 2)
+        self.assertEqual(
+            saved_content["versions"][0]["text"],
+            "Our product encourages balanced choices and supports wellness.",
+        )
+        self.assertEqual(saved_content["versions"][1]["text"], source_text)
+
+    def test_manual_correction_rejects_stale_invalid_and_automatically_fixable_inputs(self):
+        self.create_manual_claim("Manual cure claim", r"\bcures diseases\b")
+        source_text = "Our cheap product cures diseases."
+        audit, version_id = self.audit_manual_source(source_text)
+        issue = next(
+            item for item in audit["result"]["issues"]
+            if item["rule"] == "Manual cure claim"
+        )
+        payload = self.manual_correction_payload(
+            audit, version_id, issue, "supports wellness", source_text
+        )
+
+        stale = self.client.post(
+            "/api/analysis/manual-corrections",
+            json={**payload, "source_text": "Changed source text."},
+        )
+        self.assertEqual(stale.status_code, 409)
+        self.assertTrue(stale.get_json()["stale"])
+
+        mismatched_span = self.client.post(
+            "/api/analysis/manual-corrections",
+            json={**payload, "source_start": issue["location"]["start"] + 1},
+        )
+        self.assertEqual(mismatched_span.status_code, 409)
+        self.assertTrue(mismatched_span.get_json()["stale"])
+
+        missing_replacement = self.client.post(
+            "/api/analysis/manual-corrections",
+            json={**payload, "replacement_text": ""},
+        )
+        self.assertEqual(missing_replacement.status_code, 400)
+
+        invalid_replacement = self.client.post(
+            "/api/analysis/manual-corrections",
+            json={**payload, "replacement_text": "Use: an approved claim"},
+        )
+        self.assertEqual(invalid_replacement.status_code, 400)
+
+        automatic_issue = next(
+            item for item in audit["result"]["issues"]
+            if item["category"] == "Terminology"
+        )
+        automatic = self.client.post(
+            "/api/analysis/manual-corrections",
+            json=self.manual_correction_payload(
+                audit, version_id, automatic_issue, "replacement", source_text
+            ),
+        )
+        self.assertEqual(automatic.status_code, 409)
+
+    def test_manual_corrections_reject_overlapping_findings(self):
+        self.create_manual_claim("Manual phrase A", r"\bprevent common\b")
+        self.create_manual_claim("Manual phrase B", r"\bcommon illnesses\b")
+        source_text = "Products prevent common illnesses."
+        audit, version_id = self.audit_manual_source(source_text)
+        issues = [
+            item for item in audit["result"]["issues"]
+            if item["rule"] in {"Manual phrase A", "Manual phrase B"}
+        ]
+        self.assertEqual(len(issues), 2)
+        first_issue = next(item for item in issues if item["rule"] == "Manual phrase A")
+        second_issue = next(item for item in issues if item["rule"] == "Manual phrase B")
+        first = self.client.post(
+            "/api/analysis/manual-corrections",
+            json=self.manual_correction_payload(
+                audit, version_id, first_issue, "support everyday wellness", source_text
+            ),
+        )
+        self.assertEqual(first.status_code, 200, first.get_json())
+
+        overlap = self.client.post(
+            "/api/analysis/manual-corrections",
+            json=self.manual_correction_payload(
+                audit, version_id, second_issue, "support health", source_text
+            ),
+        )
+        self.assertEqual(overlap.status_code, 409)
+        self.assertTrue(overlap.get_json()["overlap"])
+
+    def test_discarding_manual_corrections_removes_only_the_staged_preview(self):
+        self.create_manual_claim("Manual cure claim", r"\bcures diseases\b")
+        source_text = "Our product cures diseases."
+        audit, version_id = self.audit_manual_source(source_text)
+        issue = next(
+            item for item in audit["result"]["issues"]
+            if item["rule"] == "Manual cure claim"
+        )
+        approved = self.client.post(
+            "/api/analysis/manual-corrections",
+            json=self.manual_correction_payload(
+                audit, version_id, issue, "supports wellness", source_text
+            ),
+        )
+        self.assertEqual(approved.status_code, 200, approved.get_json())
+
+        discarded = self.client.delete(
+            f"/api/analysis/manual-corrections/{audit['content_id']}"
+            f"?brand_id={self.brand_id}&current_version_id={version_id}"
+        )
+        self.assertEqual(discarded.status_code, 200, discarded.get_json())
+        preview = self.client.get(
+            f"/api/analysis/manual-corrections/{audit['content_id']}"
+            f"?brand_id={self.brand_id}"
+        )
+        self.assertEqual(preview.status_code, 200, preview.get_json())
+        self.assertEqual(
+            preview.get_json()["preview_state"]["corrected_text"], source_text
+        )
+        self.assertEqual(
+            preview.get_json()["preview_state"]["correction_count"], 0
+        )
+        content = self.client.get(
+            f"/api/content/{audit['content_id']}?brand_id={self.brand_id}"
+        ).get_json()
+        self.assertEqual(content["content"]["original_text"], source_text)
+        self.assertEqual(content["content"]["current_version"], audit["version"])
+        self.assertEqual(len(content["versions"]), 1)
+
+    def test_apply_rejects_a_changed_source_text_even_at_the_audited_version(self):
+        audit = self.client.post("/api/analysis/audit", json={
+            "brand_id": self.brand_id,
+            "title": "Source mismatch",
+            "text": "Our plan guarantees weight loss.",
+        }).get_json()
+        issue = next(
+            issue for issue in audit["result"]["issues"]
+            if issue.get("matched_text") == "guarantees weight loss"
+        )
+        response = self.client.post(
+            f"/api/analysis/apply-corrections/{audit['content_id']}",
+            json={
+                "brand_id": self.brand_id,
+                "issue_ids": [issue["id"]],
+                "content_version": audit["version"],
+                "source_text": "This text has changed.",
+            },
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("source text changed", response.get_json()["error"].lower())
 
     def test_conflicting_safe_replacements_are_selectable_and_version_bound(self):
         self.client.post(f"/api/brands/{self.brand_id}/claims", json={

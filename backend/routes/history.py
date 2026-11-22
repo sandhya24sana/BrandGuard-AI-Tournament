@@ -1,13 +1,107 @@
 
 import json
 import logging
-from flask import Blueprint, jsonify
+from io import BytesIO
+from flask import Blueprint, jsonify, send_file
+from werkzeug.utils import secure_filename
 from database import db_session, dict_from_row
 from api_utils import is_positive_int, validate_query_id
+from services.pdf_report import build_pdf_report
 
 logger = logging.getLogger(__name__)
 
 history_bp = Blueprint("history", __name__, url_prefix="/api/history")
+
+
+def _load_pdf_audit_data(content_id, brand_id):
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT c.*, b.name AS brand_name, b.industry, b.primary_tone
+            FROM content_items c
+            JOIN brands b ON c.brand_id = b.id
+            WHERE c.id = ? AND c.brand_id = ?
+            """,
+            (content_id, brand_id),
+        )
+        item_row = cursor.fetchone()
+        if not item_row:
+            return None
+        item = dict_from_row(item_row)
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM analysis_results
+            WHERE content_id = ? AND version_number = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (content_id, item["current_version"]),
+        )
+        analysis_row = cursor.fetchone()
+        if not analysis_row:
+            return {"item": item, "analysis": None}
+        analysis = dict_from_row(analysis_row)
+
+        for key in ("sub_scores", "issues"):
+            value = analysis.get(key)
+            if isinstance(value, str):
+                try:
+                    analysis[key] = json.loads(value)
+                except (json.JSONDecodeError, TypeError) as error:
+                    logger.warning(
+                        "Could not decode stored PDF audit data "
+                        "(exception_category=%s)",
+                        type(error).__name__,
+                    )
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM reviews
+            WHERE content_id = ?
+            ORDER BY id DESC
+            """,
+            (content_id,),
+        )
+        reviews = [dict_from_row(row) for row in cursor.fetchall()]
+
+        cursor.execute(
+            """
+            SELECT *
+            FROM content_versions
+            WHERE content_id = ?
+            ORDER BY version_number ASC
+            """,
+            (content_id,),
+        )
+        versions = [dict_from_row(row) for row in cursor.fetchall()]
+
+        cursor.execute(
+            """
+            SELECT m.issue_id, m.original_text, m.replacement_text,
+                   m.start_offset, m.end_offset, m.created_at, m.updated_at,
+                   v.version_number
+            FROM manual_correction_drafts m
+            JOIN content_versions v ON v.id = m.content_version_id
+            WHERE m.content_id = ?
+            ORDER BY v.version_number ASC, m.start_offset ASC, m.end_offset ASC
+            """,
+            (content_id,),
+        )
+        manual_corrections = [
+            dict_from_row(row) for row in cursor.fetchall()
+        ]
+
+    return {
+        "item": item,
+        "analysis": analysis,
+        "reviews": reviews,
+        "versions": versions,
+        "manual_corrections": manual_corrections,
+    }
 
 
 @history_bp.route("/dashboard-stats", methods=["GET"])
@@ -319,3 +413,136 @@ def export_audit_report(content_id):
             "success": False,
             "error": "Could not export the audit report."
         }), 500
+
+
+@history_bp.route("/export/<int:content_id>/pdf", methods=["GET"])
+def export_audit_report_pdf(content_id):
+    if not is_positive_int(content_id):
+        return jsonify({"success": False, "error": "Content item not found"}), 404
+    brand_id = validate_query_id("brand_id", required=True)
+
+    try:
+        audit_data = _load_pdf_audit_data(content_id, brand_id)
+        if not audit_data:
+            return jsonify({
+                "success": False,
+                "error": "Content item not found for the requested brand.",
+            }), 404
+        analysis = audit_data.get("analysis")
+        if not analysis:
+            return jsonify({
+                "success": False,
+                "error": "No audit result is available for the current content version.",
+            }), 404
+
+        issues = analysis.get("issues")
+        sub_scores = analysis.get("sub_scores")
+        score = analysis.get("score")
+        risk_level = analysis.get("risk_level")
+        required_score_keys = {
+            "facts", "claims", "terminology", "tone", "accessibility"
+        }
+        if (
+            not isinstance(issues, list)
+            or not all(isinstance(issue, dict) for issue in issues)
+            or not isinstance(sub_scores, dict)
+            or not required_score_keys.issubset(sub_scores)
+            or isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not 0 <= score <= 100
+            or not isinstance(risk_level, str)
+            or not risk_level.strip()
+            or any(
+                isinstance(sub_scores[key], bool)
+                or not isinstance(sub_scores[key], (int, float))
+                or not 0 <= sub_scores[key] <= 100
+                for key in required_score_keys
+            )
+        ):
+            return jsonify({
+                "success": False,
+                "error": "The stored audit result is incomplete and cannot be exported.",
+            }), 409
+
+        item = audit_data["item"]
+        versions = audit_data["versions"]
+        current_version = item["current_version"]
+        current_version_record = next(
+            (
+                version for version in versions
+                if version["version_number"] == current_version
+            ),
+            None,
+        )
+        original_version = next(
+            (version for version in versions if version["version_number"] == 1),
+            None,
+        )
+        report = {
+            "audit_id": analysis["id"],
+            "content_id": item["id"],
+            "audit_date": analysis.get("created_at"),
+            "brand_name": item["brand_name"],
+            "content_title": item.get("title"),
+            "content_type": item.get("content_type"),
+            "channel": item.get("channel"),
+            "content_version": current_version,
+            "overall_score": score,
+            "risk_level": risk_level,
+            "sub_scores": sub_scores,
+            "assessment": analysis.get("summary"),
+            "issues": issues,
+            "issue_counts": _pdf_issue_counts(issues),
+            "original_content": (
+                original_version.get("text")
+                if original_version
+                else item.get("original_text")
+            ),
+            "audited_content": (
+                current_version_record.get("text")
+                if current_version_record
+                else item.get("original_text")
+            ),
+            "correction_preview": analysis.get("corrected_text"),
+            "versions": versions,
+            "manual_corrections": audit_data["manual_corrections"],
+            "reviews": audit_data["reviews"],
+        }
+        pdf_bytes = build_pdf_report(report)
+        safe_brand_name = secure_filename(item.get("brand_name") or "") or "Brand"
+        response = send_file(
+            BytesIO(pdf_bytes),
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"BrandGuard_Audit_Report_{safe_brand_name}.pdf",
+            max_age=0,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except Exception as error:
+        logger.error(
+            "Error generating audit PDF (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({
+            "success": False,
+            "error": "Could not generate the audit report PDF.",
+        }), 500
+
+
+def _pdf_issue_counts(issues):
+    counts = {
+        "total": len(issues),
+        "critical": 0,
+        "warning": 0,
+        "informational": 0,
+    }
+    for issue in issues:
+        severity = str(issue.get("severity") or "").strip().lower()
+        if severity == "critical":
+            counts["critical"] += 1
+        elif severity == "warning":
+            counts["warning"] += 1
+        elif severity in {"info", "informational"}:
+            counts["informational"] += 1
+    return counts

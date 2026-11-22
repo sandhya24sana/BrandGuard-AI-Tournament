@@ -321,3 +321,62 @@ test('IssueCard shows separate Apply actions for GreenLeaf medical phrase findin
     await vite.close();
   }
 });
+
+test('IssueCard applies only medical findings mapped to their complete sentence', async () => {
+  const projectRoot = fileURLToPath(new URL('..', import.meta.url));
+  const vite = await createServer({
+    configFile: fileURLToPath(new URL('../vite.config.js', import.meta.url)),
+    root: projectRoot,
+    logLevel: 'silent',
+    server: { middlewareMode: true }
+  });
+  try {
+    const { default: IssueCard } = await vite.ssrLoadModule('/src/components/IssueCard.jsx');
+    const sourceText = 'GreenLeaf products cure diseases and prevent health problems.';
+    const replacement = 'Enjoy food made with natural ingredients.';
+    const sentenceSpan = { start: 0, end: Array.from(sourceText).length };
+    const mappedIssues = ['cure', 'prevent'].map((triggerText) => ({
+      id: `claim-${triggerText}`,
+      category: 'Compliance & Claims',
+      severity: 'CRITICAL',
+      rule: 'Unsupported Medical Claims',
+      trigger_text: triggerText,
+      matched_text: sourceText,
+      replacement_text: replacement,
+      auto_fixable: true,
+      location: sentenceSpan
+    }));
+    const manualWordIssue = {
+      ...mappedIssues[0],
+      id: 'claim-word-only',
+      trigger_text: 'cure',
+      matched_text: 'cure',
+      replacement_text: 'support',
+      auto_fixable: false,
+      manual_review_required: true,
+      manual_review_reason: 'A single-word claim replacement requires manual review to verify sentence grammar.',
+      location: {
+        start: sourceText.indexOf('cure'),
+        end: sourceText.indexOf('cure') + 'cure'.length
+      }
+    };
+    const cards = [...mappedIssues, manualWordIssue].map((issue) =>
+      IssueCard({
+        issue,
+        sourceText,
+        onApplyFix: () => {}
+      })
+    );
+    const markup = cards.map(renderToStaticMarkup).join('');
+
+    assert.equal(markup.match(/<button\b/g)?.length, 2);
+    assert.match(markup, /Found:<\/span>\s*<span[^>]*>&quot;cure&quot;<\/span>/);
+    assert.match(markup, /sentence grammar/);
+    assert.doesNotMatch(
+      renderToStaticMarkup(cards[2]),
+      /<button\b/
+    );
+  } finally {
+    await vite.close();
+  }
+});

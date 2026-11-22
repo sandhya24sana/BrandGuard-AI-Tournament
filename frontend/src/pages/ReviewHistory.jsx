@@ -21,6 +21,19 @@ function formatVersionDate(value) {
   return Number.isNaN(date.getTime()) ? 'Timestamp unavailable' : date.toLocaleString();
 }
 
+function getAuditPdfFilename(brandName) {
+  const safeBrandName = Array.from(String(brandName || 'Brand'), (character) => {
+    const codePoint = character.codePointAt(0);
+    return codePoint < 32 || codePoint === 127 || /[<>:"/\\|?*]/.test(character)
+      ? '_'
+      : character;
+  }).join('')
+    .replace(/\s+/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'Brand';
+  return `BrandGuard_Audit_Report_${safeBrandName}.pdf`;
+}
+
 export default function ReviewHistory({
   brandId,
   initialContentId,
@@ -35,9 +48,11 @@ export default function ReviewHistory({
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [activeModalTab, setActiveModalTab] = useState('versions');
   const [detailError, setDetailError] = useState('');
+  const [pdfDownloadContentId, setPdfDownloadContentId] = useState(null);
   const [comparisonLeftVersion, setComparisonLeftVersion] = useState('');
   const [comparisonRightVersion, setComparisonRightVersion] = useState('');
   const detailRequestId = useRef(0);
+  const pdfDownloadRequestRef = useRef(false);
 
   const selectContentDetail = (detail) => {
     const versions = getSavedVersions(detail).sort(
@@ -99,10 +114,29 @@ export default function ReviewHistory({
     }
   };
 
-  const handleEditContent = (content) => {
+  const handleEditContent = async (content) => {
     if (!onEditContent) return;
-    setDetailModalOpen(false);
-    onEditContent(content);
+    const requestId = ++detailRequestId.current;
+    setDetailError('');
+    try {
+      const detail = await api.getContentDetail(content.id, brandId);
+      if (requestId !== detailRequestId.current) return;
+      if (!detail.success || !detail.content) {
+        throw new Error(detail.error || 'Could not load the saved content.');
+      }
+      if (brandId && detail.content.brand_id !== brandId) {
+        throw new Error('This content does not belong to the selected brand.');
+      }
+      setDetailModalOpen(false);
+      onEditContent({
+        ...detail.content,
+        latest_analysis: detail.latest_analysis || null,
+      });
+    } catch (error) {
+      if (requestId === detailRequestId.current) {
+        setDetailError(error.message || 'Could not load the saved content.');
+      }
+    }
   };
 
   useEffect(() => {
@@ -168,6 +202,37 @@ export default function ReviewHistory({
       }
     } catch (err) {
       setDetailError(err.message || 'Could not export the audit report.');
+    }
+  };
+
+  const handleDownloadPdfReport = async (contentId, brandName) => {
+    if (pdfDownloadRequestRef.current) return;
+    pdfDownloadRequestRef.current = true;
+    setPdfDownloadContentId(contentId);
+    setDetailError('');
+    let downloadUrl = null;
+    let downloadAnchor = null;
+    try {
+      const result = await api.downloadAuditReportPdf(contentId, brandId);
+      if (!result.success || !result.blob) {
+        throw new Error(result.error || 'Could not generate the PDF report.');
+      }
+      downloadUrl = URL.createObjectURL(result.blob);
+      downloadAnchor = document.createElement('a');
+      downloadAnchor.href = downloadUrl;
+      downloadAnchor.download = getAuditPdfFilename(brandName);
+      downloadAnchor.hidden = true;
+      document.body.appendChild(downloadAnchor);
+      downloadAnchor.click();
+    } catch (error) {
+      setDetailError(error.message || 'Could not generate the PDF report.');
+    } finally {
+      downloadAnchor?.remove();
+      if (downloadUrl) {
+        window.setTimeout(() => URL.revokeObjectURL(downloadUrl), 1000);
+      }
+      pdfDownloadRequestRef.current = false;
+      setPdfDownloadContentId(null);
     }
   };
 
@@ -528,14 +593,32 @@ export default function ReviewHistory({
             </div>
 
             {/* Modal Footer */}
-            <div className="px-6 py-3 border-t border-slate-100 bg-slate-50 flex items-center justify-between">
-              <button
-                onClick={() => handleExportReport(selectedDetail.content.id)}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors shadow-xs"
-              >
-                <Download className="w-3.5 h-3.5 text-slate-600" />
-                <span>Export JSON Record</span>
-              </button>
+            <div className="px-6 py-3 border-t border-slate-100 bg-slate-50 flex items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => handleExportReport(selectedDetail.content.id)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors shadow-xs"
+                >
+                  <Download className="w-3.5 h-3.5 text-slate-600" />
+                  <span>Export JSON Record</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleDownloadPdfReport(
+                    selectedDetail.content.id,
+                    selectedDetail.content.brand_name,
+                  )}
+                  disabled={pdfDownloadContentId !== null}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white border border-blue-600 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>
+                    {pdfDownloadContentId === selectedDetail.content.id
+                      ? 'Generating PDF…'
+                      : 'Download PDF Report'}
+                  </span>
+                </button>
+              </div>
               <button
                 onClick={() => setDetailModalOpen(false)}
                 className="px-4 py-1.5 rounded-lg text-xs font-semibold bg-slate-200 text-slate-700 hover:bg-slate-300 transition-colors"

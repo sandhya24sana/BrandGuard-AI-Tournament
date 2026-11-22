@@ -80,9 +80,32 @@ def attach_replacement_options(
         ):
             continue
 
-        replacement = safe_replacement_text(
-            issue.get("replacement_text"), matched_text
+        replacement_candidate = issue.get("replacement_text")
+        replacement = safe_replacement_text(replacement_candidate, matched_text)
+        rule_name = str(issue.get("rule") or "").casefold()
+        is_medical_rule = (
+            ("medical" in rule_name or "health" in rule_name)
+            and "claim" in rule_name
         )
+        if (
+            replacement is not None
+            and is_medical_rule
+            and is_complete_sentence(replacement)
+        ):
+            mapped_span = sentence_span(source_text, start, end)
+            if mapped_span is not None and mapped_span != (start, end):
+                issue["trigger_text"] = issue.get("trigger_text") or matched_text
+                issue["trigger_location"] = issue.get("trigger_location") or {
+                    "start": start,
+                    "end": end,
+                }
+                start, end = mapped_span
+                matched_text = source_text[start:end]
+                issue["matched_text"] = matched_text
+                issue["location"] = {"start": start, "end": end}
+                replacement = safe_replacement_text(
+                    replacement_candidate, matched_text
+                )
         if replacement is not None and not _fits_claim_replacement_span(
             source_text,
             start,
@@ -94,6 +117,18 @@ def attach_replacement_options(
             issue["manual_review_required"] = True
             issue["manual_review_reason"] = (
                 "A full-sentence claim replacement cannot be applied to a partial source span."
+            )
+            continue
+        if (
+            replacement is not None
+            and "claim" in str(issue.get("category") or "").casefold()
+            and is_medical_rule
+            and re.fullmatch(r"\w+", matched_text, re.UNICODE)
+        ):
+            issue["auto_fixable"] = False
+            issue["manual_review_required"] = True
+            issue["manual_review_reason"] = (
+                "A single-word claim replacement requires manual review to verify sentence grammar."
             )
             continue
         if replacement is not None:
@@ -124,6 +159,17 @@ def attach_replacement_options(
             issue["manual_review_reason"] = (
                 "Choose one validated replacement for this text span."
             )
+
+    replacement_spans = list(replacements_by_span.items())
+    for index, ((left_start, left_end), left_issues) in enumerate(replacement_spans):
+        for (right_start, right_end), right_issues in replacement_spans[index + 1:]:
+            if left_start < right_end and right_start < left_end:
+                for issue, _ in left_issues + right_issues:
+                    issue["auto_fixable"] = False
+                    issue["manual_review_required"] = True
+                    issue["manual_review_reason"] = (
+                        "Overlapping correction spans require manual review."
+                    )
 
 
 def legacy_terminology_replacement(rule: Dict[str, Any]) -> Optional[str]:
@@ -157,14 +203,19 @@ def _case_adjusted_replacement(matched_text: str, replacement_text: str) -> str:
     return replacement_text
 
 
-def _sentence_span(text: str, start: int, end: int) -> Optional[Tuple[int, int]]:
+def sentence_span(text: str, start: int, end: int) -> Optional[Tuple[int, int]]:
     for match in re.finditer(r"[^.!?\r\n]+(?:[.!?]+|$)", text):
         if match.start() <= start and end <= match.end():
-            return match.span()
+            sentence_start, sentence_end = match.span()
+            while sentence_start < sentence_end and text[sentence_start].isspace():
+                sentence_start += 1
+            while sentence_end > sentence_start and text[sentence_end - 1].isspace():
+                sentence_end -= 1
+            return sentence_start, sentence_end
     return None
 
 
-def _is_complete_sentence(text: str) -> bool:
+def is_complete_sentence(text: str) -> bool:
     return bool(re.search(r"[.!?][\"'’”)\]]*\s*$", text))
 
 
@@ -175,9 +226,9 @@ def _fits_claim_replacement_span(
     category: str,
     replacement: str,
 ) -> bool:
-    if "claim" not in category or not _is_complete_sentence(replacement):
+    if "claim" not in category or not is_complete_sentence(replacement):
         return True
-    return _sentence_span(text, start, end) == (start, end)
+    return sentence_span(text, start, end) == (start, end)
 
 
 def apply_corrections(

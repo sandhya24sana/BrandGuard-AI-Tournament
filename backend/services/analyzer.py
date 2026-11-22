@@ -250,12 +250,63 @@ class GovernanceAnalyzer:
         existing_matches = {
             (
                 category_key(issue),
-                issue.get("matched_text", "").casefold(),
-                (issue.get("location") or {}).get("start"),
-                (issue.get("location") or {}).get("end"),
+                (
+                    issue.get("trigger_text")
+                    or issue.get("matched_text", "")
+                ).casefold(),
+                (
+                    issue.get("trigger_location")
+                    or issue.get("location")
+                    or {}
+                ).get("start"),
+                (
+                    issue.get("trigger_location")
+                    or issue.get("location")
+                    or {}
+                ).get("end"),
             )
             for issue in combined_issues
         }
+
+        def overlaps_existing_claim(ai_issue):
+            if category_key(ai_issue) != "claims":
+                return False
+            ai_location = ai_issue.get("location") or {}
+            ai_start, ai_end = ai_location.get("start"), ai_location.get("end")
+            if (
+                not isinstance(ai_start, int)
+                or isinstance(ai_start, bool)
+                or not isinstance(ai_end, int)
+                or isinstance(ai_end, bool)
+                or ai_start >= ai_end
+            ):
+                return False
+            ai_rule = str(ai_issue.get("rule") or "").strip().casefold()
+
+            for existing_issue in combined_issues:
+                if (
+                    category_key(existing_issue) != "claims"
+                    or str(existing_issue.get("rule") or "").strip().casefold()
+                    != ai_rule
+                ):
+                    continue
+                location = (
+                    existing_issue.get("trigger_location")
+                    or existing_issue.get("location")
+                    or {}
+                )
+                start, end = location.get("start"), location.get("end")
+                if (
+                    isinstance(start, int)
+                    and not isinstance(start, bool)
+                    and isinstance(end, int)
+                    and not isinstance(end, bool)
+                    and start < end
+                    and start < ai_end
+                    and ai_start < end
+                ):
+                    return True
+            return False
 
         # Add AI issues that were not already detected by deterministic rules.
         for ai_issue in ai_res.get("issues", []):
@@ -281,7 +332,11 @@ class GovernanceAnalyzer:
                 ] == matched
             )
 
-            if matched and identity not in existing_matches:
+            if (
+                matched
+                and identity not in existing_matches
+                and not overlaps_existing_claim(ai_issue)
+            ):
                 ai_issue["source"] = "AI"
 
                 replacement_text = (
@@ -306,7 +361,15 @@ class GovernanceAnalyzer:
                     configured_replacements = set()
 
                     for rule_issue in rule_res.get("issues", []):
-                        rule_location = rule_issue.get("location") or {}
+                        rule_location = (
+                            rule_issue.get("trigger_location")
+                            or rule_issue.get("location")
+                            or {}
+                        )
+                        rule_match = (
+                            rule_issue.get("trigger_text")
+                            or rule_issue.get("matched_text")
+                        )
 
                         if (
                             category_key(rule_issue) == "claims"
@@ -319,7 +382,7 @@ class GovernanceAnalyzer:
                             and 0 <= rule_location["start"] < rule_location["end"] <= len(source_text)
                             and source_text[
                                 rule_location["start"]:rule_location["end"]
-                            ] == rule_issue.get("matched_text")
+                            ] == rule_match
                         ):
                             configured_replacement = safe_replacement_text(
                                 rule_issue.get("replacement_text"),
