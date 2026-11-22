@@ -7,16 +7,191 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 _test_database_dir = tempfile.TemporaryDirectory(prefix="brandguard-test-bootstrap-")
+os.environ["DATABASE_URL"] = " "
 os.environ["DATABASE_PATH"] = str(Path(_test_database_dir.name) / "bootstrap.db")
 
 from app import create_app
 from database import get_db_connection
 from routes.analysis import analyzer
-from services.correction_engine import apply_corrections, validate_replacement_text
+from services.correction_engine import (
+    apply_corrections,
+    attach_replacement_options,
+    validate_replacement_text,
+)
 from services.rules_engine import RuleBasedAnalyzer
 
 
 class CorrectionEngineTests(unittest.TestCase):
+    def test_non_numeric_facts_check_explicit_contradictions_without_auto_fixing(self):
+        fact = {
+            "id": 12,
+            "category": "Ingredients",
+            "statement": "The formula contains no synthetic fragrance.",
+            "keywords": "formula, fragrance",
+        }
+        engine = RuleBasedAnalyzer(
+            brand={"name": "Test"},
+            facts=[fact],
+            terminology=[],
+        )
+
+        valid = engine.analyze(
+            "The formula contains no synthetic fragrance."
+        )
+        self.assertFalse(any(
+            issue["category"] == "Fact Accuracy"
+            for issue in valid["issues"]
+        ))
+
+        invalid = engine.analyze(
+            "The formula contains synthetic fragrance."
+        )
+        fact_issue = next(
+            issue for issue in invalid["issues"]
+            if issue["category"] == "Fact Accuracy"
+        )
+        self.assertEqual(fact_issue["matched_text"], "contains")
+        self.assertIn("approved brand fact", fact_issue["explanation"])
+        self.assertFalse(fact_issue["auto_fixable"])
+        self.assertTrue(fact_issue["manual_review_required"])
+        self.assertIsNone(fact_issue["replacement_text"])
+
+    def test_non_numeric_facts_can_use_statement_when_keywords_are_missing(self):
+        engine = RuleBasedAnalyzer(
+            brand={"name": "Test"},
+            facts=[{
+                "id": 13,
+                "statement": "The formula uses natural ingredients.",
+                "keywords": "",
+            }],
+            terminology=[],
+        )
+
+        result = engine.analyze("The formula uses synthetic ingredients.")
+        fact_issues = [
+            issue for issue in result["issues"]
+            if issue["category"] == "Fact Accuracy"
+        ]
+        self.assertEqual(len(fact_issues), 1)
+        self.assertEqual(fact_issues[0]["matched_text"], "synthetic")
+
+    def test_non_numeric_location_fact_detects_conflicting_value(self):
+        engine = RuleBasedAnalyzer(
+            brand={"name": "Test"},
+            facts=[{
+                "id": 14,
+                "statement": "The company is headquartered in Canada.",
+                "keywords": "company, headquartered",
+            }],
+            terminology=[],
+        )
+
+        valid = engine.analyze("The company is headquartered in Canada.")
+        self.assertFalse(any(
+            issue["category"] == "Fact Accuracy"
+            for issue in valid["issues"]
+        ))
+        unrelated = engine.analyze(
+            "The company does not provide services in Canada."
+        )
+        self.assertFalse(any(
+            issue["category"] == "Fact Accuracy"
+            for issue in unrelated["issues"]
+        ))
+
+        invalid = engine.analyze(
+            "The company is headquartered in Australia."
+        )
+        fact_issue = next(
+            issue for issue in invalid["issues"]
+            if issue["category"] == "Fact Accuracy"
+        )
+        self.assertEqual(fact_issue["matched_text"], "Australia")
+        self.assertEqual(
+            invalid["corrected_text"],
+            "The company is headquartered in Australia.",
+        )
+
+    def test_custom_voice_traits_and_target_audience_rules(self):
+        engine = RuleBasedAnalyzer(
+            brand={
+                "name": "Test",
+                "voice_traits": ["warm", "concise", "precise", "accessible"],
+                "target_audience": "beginner consumers",
+            },
+            facts=[],
+            terminology=[],
+        )
+
+        valid = engine.analyze(
+            "For consumers, this is a clear guide with a friendly welcome."
+        )
+        self.assertFalse(any(
+            issue["rule"] == "Target Audience Suitability"
+            or issue["category"] == "Voice & Tone"
+            for issue in valid["issues"]
+        ))
+
+        invalid = engine.analyze(
+            "Our cold service is available for clinicians. "
+            "It is important to note that the idempotent API always helps."
+        )
+        tone_issue = next(
+            issue for issue in invalid["issues"]
+            if issue["category"] == "Voice & Tone"
+            and issue["rule"] == "Configured Voice Trait: warm"
+        )
+        self.assertEqual(tone_issue["matched_text"], "cold")
+        concise_issue = next(
+            issue for issue in invalid["issues"]
+            if issue["category"] == "Voice & Tone"
+            and issue["rule"] == "Configured Voice Trait: concise"
+        )
+        self.assertEqual(
+            concise_issue["matched_text"],
+            "It is important to note that",
+        )
+        precise_issue = next(
+            issue for issue in invalid["issues"]
+            if issue["category"] == "Voice & Tone"
+            and issue["rule"] == "Configured Voice Trait: precise"
+        )
+        self.assertEqual(precise_issue["matched_text"], "always")
+        accessible_issue = next(
+            issue for issue in invalid["issues"]
+            if issue["category"] == "Voice & Tone"
+            and issue["rule"] == "Configured Voice Trait: accessible"
+        )
+        self.assertEqual(accessible_issue["matched_text"], "idempotent")
+
+        audience_issues = [
+            issue for issue in invalid["issues"]
+            if issue["rule"] == "Target Audience Suitability"
+        ]
+        self.assertEqual(
+            {issue["matched_text"].casefold() for issue in audience_issues},
+            {"for clinicians", "idempotent"},
+        )
+        self.assertLessEqual(
+            invalid["sub_scores"]["accessibility"],
+            74,
+        )
+
+    def test_missing_voice_audience_and_fact_configuration_is_safe(self):
+        engine = RuleBasedAnalyzer(
+            brand={"name": "Test"},
+            facts=[],
+            terminology=[],
+        )
+        result = engine.analyze(
+            "For clinicians, the synthetic API is cold and idempotent."
+        )
+        self.assertFalse(any(
+            issue["category"] in {"Fact Accuracy", "Voice & Tone"}
+            or issue["rule"] == "Target Audience Suitability"
+            for issue in result["issues"]
+        ))
+
     def test_phrase_replacements_handle_case_and_preserve_punctuation(self):
         examples = (
             ("cures diabetes!", "supports wellness", "supports wellness!"),
@@ -197,6 +372,28 @@ class CorrectionEngineTests(unittest.TestCase):
         ])
         self.assertEqual(overlapping["text"], "abcdef")
         self.assertEqual(set(overlapping["manual_review"]), {"left", "right"})
+        selected_overlap = apply_corrections(
+            "abcdef",
+            [
+                {
+                    "id": "left",
+                    "matched_text": "abcd",
+                    "replacement_text": "left",
+                    "auto_fixable": True,
+                    "location": {"start": 0, "end": 4},
+                },
+                {
+                    "id": "right",
+                    "matched_text": "cdef",
+                    "replacement_text": "right",
+                    "auto_fixable": True,
+                    "location": {"start": 2, "end": 6},
+                },
+            ],
+            ["left"],
+        )
+        self.assertEqual(selected_overlap["text"], "leftef")
+        self.assertEqual(selected_overlap["applied_issue_ids"], ["left"])
 
     def test_duplicate_same_span_is_replaced_once_and_stale_apply_is_rejected(self):
         issue = {
@@ -215,6 +412,58 @@ class CorrectionEngineTests(unittest.TestCase):
         self.assertEqual(repeated["text"], result["text"])
         self.assertIn("same", repeated["manual_review"])
 
+    def test_full_sentence_claim_replacements_for_partial_spans_require_manual_review(self):
+        source = "Products cure diseases and prevent health problems."
+        replacement = "Our products support everyday wellness."
+        issues = [
+            {
+                "id": "cure",
+                "category": "Compliance & Claims",
+                "matched_text": "cure diseases",
+                "replacement_text": replacement,
+                "auto_fixable": True,
+                "location": {"start": 9, "end": 22},
+            },
+            {
+                "id": "prevent",
+                "category": "Compliance & Claims",
+                "matched_text": "prevent health problems",
+                "replacement_text": replacement,
+                "auto_fixable": True,
+                "location": {"start": 27, "end": 50},
+            },
+        ]
+        attach_replacement_options(source, issues)
+        self.assertTrue(all(not issue["auto_fixable"] for issue in issues))
+        self.assertTrue(all(issue["manual_review_required"] for issue in issues))
+
+        result = apply_corrections(source, issues)
+        self.assertEqual(result["text"], source)
+        self.assertEqual(result["applied_issue_ids"], [])
+        self.assertCountEqual(result["manual_review"], ["cure", "prevent"])
+
+        repeated_source = (
+            "Products cure diseases.\n\n"
+            "Products prevent health problems."
+        )
+        second_start = repeated_source.index("prevent")
+        repeated = apply_corrections(repeated_source, [
+            {
+                **issues[0],
+                "location": {"start": 9, "end": 22},
+            },
+            {
+                **issues[1],
+                "location": {
+                    "start": second_start,
+                    "end": second_start + len("prevent health problems"),
+                },
+            },
+        ])
+        self.assertEqual(repeated["text"], repeated_source)
+        self.assertEqual(repeated["applied_issue_ids"], [])
+        self.assertCountEqual(repeated["manual_review"], ["cure", "prevent"])
+
 
 class CorrectionWorkflowAPITests(unittest.TestCase):
     def setUp(self):
@@ -222,7 +471,9 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
         self.db_path = Path(self.temp_dir.name) / "corrections.db"
         self.app = create_app({
             "TESTING": True,
+            "DATABASE_URL": "",
             "DATABASE_PATH": str(self.db_path),
+            "RATELIMIT_ENABLED": False,
         })
         self.client = self.app.test_client()
         analyzer.ai_service.gemini_key = ""
@@ -245,6 +496,98 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
+    def test_conflicting_safe_replacements_are_selectable_and_version_bound(self):
+        self.client.post(f"/api/brands/{self.brand_id}/claims", json={
+            "rule_name": "Affordable wording",
+            "pattern_or_trigger": r"\bcheap\b",
+            "replacement_text": "budget-friendly",
+            "required_disclaimer": "Substantiate advertising claims.",
+            "explanation": "Use approved value-oriented wording.",
+            "severity": "critical",
+        })
+        audit = self.client.post("/api/analysis/audit", json={
+            "brand_id": self.brand_id,
+            "title": "Selectable correction",
+            "text": "cheap plans.",
+        }).get_json()
+        issues = [
+            issue for issue in audit["result"]["issues"]
+            if issue.get("matched_text", "").casefold() == "cheap"
+        ]
+        self.assertEqual(len(issues), 2)
+        options = issues[0]["replacement_options"]
+        self.assertEqual(len(options), 2)
+        self.assertTrue(all(issue["replacement_options"] == options for issue in issues))
+        self.assertEqual(audit["result"]["corrected_text"], "cheap plans.")
+        self.assertTrue(all(not issue["auto_fixable"] for issue in issues))
+        self.assertTrue(all(issue["replacement_choice_required"] for issue in issues))
+
+        selected_option = options[1]
+        selected_issue = next(
+            issue for issue in issues if issue["id"] == selected_option["issue_id"]
+        )
+        response = self.client.post(
+            f"/api/analysis/apply-corrections/{audit['content_id']}",
+            json={
+                "brand_id": self.brand_id,
+                "issue_ids": [selected_option["issue_id"]],
+                "content_version": audit["version"],
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(
+            response.get_json()["applied_text"],
+            f"{selected_option['replacement_text']} plans.",
+        )
+        self.assertEqual(
+            response.get_json()["applied_issue_ids"],
+            [selected_option["issue_id"]],
+        )
+
+        stale = self.client.post(
+            f"/api/analysis/apply-corrections/{audit['content_id']}",
+            json={
+                "brand_id": self.brand_id,
+                "issue_ids": [selected_issue["id"]],
+                "content_version": audit["version"],
+            },
+        )
+        self.assertEqual(stale.status_code, 409)
+        self.assertEqual(
+            self.client.get(
+                f"/api/content/{audit['content_id']}"
+            ).get_json()["content"]["current_version"],
+            2,
+        )
+
+    def test_individual_apply_requires_content_version_without_saving(self):
+        source_text = "cheap plans."
+        audit = self.client.post("/api/analysis/audit", json={
+            "brand_id": self.brand_id,
+            "title": "Version-bound correction",
+            "text": source_text,
+        }).get_json()
+        issue = next(
+            issue for issue in audit["result"]["issues"]
+            if issue["category"] == "Terminology"
+        )
+
+        response = self.client.post(
+            f"/api/analysis/apply-corrections/{audit['content_id']}",
+            json={
+                "brand_id": self.brand_id,
+                "issue_ids": [issue["id"]],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("content_version is required", response.get_json()["error"])
+        content = self.client.get(
+            f"/api/content/{audit['content_id']}"
+        ).get_json()["content"]
+        self.assertEqual(content["current_version"], audit["version"])
+        self.assertEqual(content["original_text"], source_text)
+
     def test_individual_then_adopt_all_reanalyzes_and_preserves_every_version(self):
         original = (
             "Cheap plans are advertised as 'guarantees weight loss'; "
@@ -264,7 +607,11 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
 
         individual = self.client.post(
             f"/api/analysis/apply-corrections/{content_id}",
-            json={"issue_ids": [term_issues[0]["id"]]},
+            json={
+                "brand_id": self.brand_id,
+                "issue_ids": [term_issues[0]["id"]],
+                "content_version": audit["version"],
+            },
         )
         self.assertEqual(individual.status_code, 200, individual.get_json())
         individual_data = individual.get_json()
@@ -273,6 +620,10 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
             "cheap snacks repeat 'guarantees weight loss'."
         )
         self.assertEqual(individual_data["applied_text"], once_corrected)
+        self.assertEqual(
+            individual_data["applied_issue_ids"],
+            [term_issues[0]["id"]],
+        )
         self.assertEqual(individual_data["new_version"], 2)
         self.assertEqual(individual_data["result"]["score"], 49)
         self.assertTrue(individual_data["correction_review"]["manual_review_required"])
@@ -281,14 +632,18 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
 
         repeated = self.client.post(
             f"/api/analysis/apply-corrections/{content_id}",
-            json={"issue_ids": [term_issues[0]["id"]]},
+            json={
+                "brand_id": self.brand_id,
+                "issue_ids": [term_issues[0]["id"]],
+                "content_version": audit["version"],
+            },
         )
         self.assertEqual(repeated.status_code, 409)
         self.assertEqual(repeated.get_json()["success"], False)
 
         adopted = self.client.post(
             f"/api/analysis/apply-corrections/{content_id}",
-            json={"apply_all": True},
+            json={"brand_id": self.brand_id, "apply_all": True},
         )
         self.assertEqual(adopted.status_code, 200, adopted.get_json())
         adopted_data = adopted.get_json()
@@ -330,13 +685,17 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
         self.assertEqual(claim["required_disclaimer"], "Use only medically supported statements.")
         applied = self.client.post(
             f"/api/analysis/apply-corrections/{audit['content_id']}",
-            json={"issue_ids": [claim["id"]]},
+            json={
+                "brand_id": self.brand_id,
+                "issue_ids": [claim["id"]],
+                "content_version": audit["version"],
+            },
         )
         self.assertEqual(applied.status_code, 409)
 
         bulk = self.client.post(
             f"/api/analysis/apply-corrections/{audit['content_id']}",
-            json={"apply_all": True},
+            json={"brand_id": self.brand_id, "apply_all": True},
         )
         self.assertEqual(bulk.status_code, 200, bulk.get_json())
         self.assertEqual(bulk.get_json()["applied_text"], "The affordable treatment cures diabetes.")
@@ -346,7 +705,7 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
 
         no_safe_corrections = self.client.post(
             f"/api/analysis/apply-corrections/{audit['content_id']}",
-            json={"apply_all": True},
+            json={"brand_id": self.brand_id, "apply_all": True},
         )
         self.assertEqual(no_safe_corrections.status_code, 409)
         self.assertEqual(
@@ -383,7 +742,11 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
 
         response = self.client.post(
             f"/api/analysis/apply-corrections/{audit['content_id']}",
-            json={"issue_ids": [issue["id"]]},
+            json={
+                "brand_id": brand_id,
+                "issue_ids": [issue["id"]],
+                "content_version": audit["version"],
+            },
         )
         self.assertEqual(response.status_code, 200, response.get_json())
         self.assertEqual(
@@ -391,6 +754,77 @@ class CorrectionWorkflowAPITests(unittest.TestCase):
             "Enjoy food made with natural ingredients.",
         )
         self.assertEqual(response.get_json()["result"]["issues"], [])
+
+    def test_medical_claim_patterns_match_legacy_alternation_only_for_their_brand(self):
+        legacy_pattern = r"(?i)\b(cures\|treats\|prevents)\b"
+        claim_response = self.client.post(f"/api/brands/{self.brand_id}/claims", json={
+            "rule_name": "Unsupported Medical Claims",
+            "pattern_or_trigger": legacy_pattern,
+            "severity": "critical",
+            "explanation": "Unsupported medical claims require review.",
+        })
+        self.assertEqual(claim_response.status_code, 200, claim_response.get_json())
+        claim_id = claim_response.get_json()["rule_id"]
+
+        examples = (
+            ("Our products cure diseases.", "cure diseases"),
+            ("Our products cures diseases.", "cures diseases"),
+            ("Our products treat diseases.", "treat diseases"),
+            ("Our products treats diseases.", "treats diseases"),
+            ("Our products prevent health problems.", "prevent health problems"),
+            ("Our products prevents health problems.", "prevents health problems"),
+            ("Our products provide quality ingredients.", None),
+        )
+        for text, expected_match in examples:
+            with self.subTest(text=text):
+                response = self.client.post("/api/analysis/audit", json={
+                    "brand_id": self.brand_id,
+                    "title": "Medical claim pattern",
+                    "text": text,
+                })
+                self.assertEqual(response.status_code, 200, response.get_json())
+                result = response.get_json()["result"]
+                medical_issues = [
+                    issue for issue in result["issues"]
+                    if issue["rule"] == "Unsupported Medical Claims"
+                ]
+
+                if expected_match is None:
+                    self.assertEqual(medical_issues, [])
+                    self.assertEqual(result["score"], 100)
+                else:
+                    self.assertEqual(len(medical_issues), 1)
+                    issue = medical_issues[0]
+                    self.assertEqual(issue["matched_text"], expected_match)
+                    self.assertEqual(issue["category"], "Compliance & Claims")
+                    self.assertEqual(issue["severity"], "CRITICAL")
+                    self.assertLessEqual(result["sub_scores"]["claims"], 49)
+                    self.assertLessEqual(result["score"], 49)
+
+        with self.app.app_context():
+            conn = get_db_connection()
+            try:
+                saved_rule = conn.execute(
+                    "SELECT pattern_or_trigger FROM brand_claim_rules WHERE id = ?",
+                    (claim_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+        self.assertEqual(saved_rule["pattern_or_trigger"], legacy_pattern)
+
+        other_brand_id = self.client.post(
+            "/api/brands", json={"name": "Unrelated Brand"}
+        ).get_json()["brand_id"]
+        other_brand_audit = self.client.post("/api/analysis/audit", json={
+            "brand_id": other_brand_id,
+            "title": "Other brand",
+            "text": "Our products cure diseases.",
+        }).get_json()
+        self.assertFalse(any(
+            issue["rule"] == "Unsupported Medical Claims"
+            for issue in other_brand_audit["result"]["issues"]
+        ))
+        self.assertEqual(other_brand_audit["result"]["score"], 100)
 
     def test_rule_creation_validates_replacement_text_and_keeps_disclaimer_legacy(self):
         invalid = self.client.post(f"/api/brands/{self.brand_id}/claims", json={
@@ -461,7 +895,9 @@ class AdditiveGuidelineMigrationTests(unittest.TestCase):
 
             app = create_app({
                 "TESTING": True,
+                "DATABASE_URL": "",
                 "DATABASE_PATH": str(db_path),
+                "RATELIMIT_ENABLED": False,
             })
             with app.app_context():
                 connection = get_db_connection()

@@ -21,6 +21,7 @@ export default function App() {
   const [brandCreatedMessage, setBrandCreatedMessage] = useState('');
   const brandCreatedTimerRef = useRef(null);
   const [auditIdToInspect, setAuditIdToInspect] = useState(null);
+  const [contentToEdit, setContentToEdit] = useState(null);
 
   const initData = async () => {
     setLoading(true);
@@ -95,8 +96,40 @@ export default function App() {
     await refreshBrands(null);
   };
 
+  const handleEditContent = (content) => {
+    if (
+      !content
+      || !Number.isInteger(content.id)
+      || content.id < 1
+      || !Number.isInteger(content.brand_id)
+      || content.brand_id < 1
+    ) {
+      return;
+    }
+
+    setContentToEdit(content);
+    setSelectedBrandId(content.brand_id);
+    setCurrentTab('analyzer');
+  };
+
+  const handleFinishContentEdit = () => {
+    setContentToEdit(null);
+    setCurrentTab('reviews');
+  };
+
+  const handleNewScan = () => {
+    setContentToEdit(null);
+    setCurrentTab('analyzer');
+  };
+
+  const handleTabChange = (tab) => {
+    setContentToEdit(null);
+    setCurrentTab(tab);
+  };
+
   const handleInspectAudit = (auditId) => {
     if (!Number.isInteger(auditId) || auditId < 1) return;
+    setContentToEdit(null);
     setAuditIdToInspect(auditId);
     setCurrentTab('reviews');
   };
@@ -112,11 +145,11 @@ export default function App() {
       {/* Left Sidebar */}
       <Sidebar
         currentTab={currentTab}
-        setCurrentTab={setCurrentTab}
+        setCurrentTab={handleTabChange}
         systemStatus={systemStatus}
         isOpen={isSidebarOpen}
         onClose={() => setIsSidebarOpen(false)}
-        onNewScan={() => setCurrentTab('analyzer')}
+        onNewScan={handleNewScan}
       />
 
       {/* Main Content Area */}
@@ -127,7 +160,7 @@ export default function App() {
           selectedBrandId={selectedBrandId}
           setSelectedBrandId={setSelectedBrandId}
           onOpenSidebar={() => setIsSidebarOpen(true)}
-          onNewScan={() => setCurrentTab('analyzer')}
+          onNewScan={handleNewScan}
           currentTab={currentTab}
           onCreateBrand={openCreateBrand}
         />
@@ -176,7 +209,7 @@ export default function App() {
                 <Dashboard
                   brandId={selectedBrandId}
                   brands={brands}
-                  onNavigateToAnalyzer={() => setCurrentTab('analyzer')}
+                  onNavigateToAnalyzer={handleNewScan}
                   onNavigateToGuidelines={() => setCurrentTab('guidelines')}
                   onInspectAudit={handleInspectAudit}
                 />
@@ -186,6 +219,8 @@ export default function App() {
                 <ContentAnalyzer
                   brandId={selectedBrandId}
                   brandName={brands.find((brand) => brand.id === selectedBrandId)?.name}
+                  contentToEdit={contentToEdit}
+                  onCancelEdit={handleFinishContentEdit}
                 />
               )}
 
@@ -202,7 +237,7 @@ export default function App() {
                   brandId={selectedBrandId}
                   initialContentId={auditIdToInspect}
                   onInitialContentHandled={clearAuditToInspect}
-                  onSelectContentToAnalyze={() => setCurrentTab('analyzer')}
+                  onEditContent={handleEditContent}
                 />
               )}
                 </>

@@ -3,7 +3,14 @@ import logging
 import re
 from flask import Blueprint, jsonify
 from database import db_session, dict_from_row
-from api_utils import json_object_payload, validate_string_fields
+from api_utils import (
+    is_positive_int,
+    json_object_payload,
+    validate_list_field,
+    validate_query_id,
+    validate_required_fields,
+    validate_string_fields,
+)
 from services.correction_engine import validate_replacement_text
 from services.rules_engine import validate_claim_pattern
 
@@ -34,12 +41,17 @@ def get_brands():
                     b["voice_traits"] = []
 
         return jsonify({"success": True, "brands": brands})
-    except Exception as e:
-        logger.exception("Error in get_brands: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error in get_brands (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not retrieve brands."}), 500
 
 @brands_bp.route("/<int:brand_id>", methods=["DELETE"])
 def delete_brand(brand_id):
+    if not is_positive_int(brand_id):
+        return jsonify({"success": False, "error": "Brand not found"}), 404
     try:
         with db_session() as conn:
             cursor = conn.cursor()
@@ -47,12 +59,17 @@ def delete_brand(brand_id):
             if cursor.rowcount == 0:
                 return jsonify({"success": False, "error": "Brand not found"}), 404
         return jsonify({"success": True, "message": "Brand and related records deleted"})
-    except Exception as e:
-        logger.exception("Error deleting brand: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error deleting brand (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not delete the brand."}), 500
 
 @brands_bp.route("/<int:brand_id>", methods=["GET"])
 def get_brand_details(brand_id):
+    if not is_positive_int(brand_id):
+        return jsonify({"success": False, "error": "Brand not found"}), 404
     try:
         with db_session() as conn:
             cursor = conn.cursor()
@@ -101,9 +118,12 @@ def get_brand_details(brand_id):
             "visual_rules": visual,
             "claim_rules": claims
         })
-    except Exception as e:
-        logger.exception("Error in get_brand_details: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error in get_brand_details (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not retrieve brand details."}), 500
 
 @brands_bp.route("", methods=["POST"])
 def create_brand():
@@ -111,7 +131,16 @@ def create_brand():
     validate_string_fields(
         data,
         ("name", "tagline", "description", "industry", "primary_tone", "target_audience"),
+        max_lengths={
+            "name": 200,
+            "tagline": 500,
+            "description": 5000,
+            "industry": 200,
+            "primary_tone": 200,
+            "target_audience": 1000,
+        },
     )
+    validate_required_fields(data, ("name",))
     name = data.get("name", "")
     if not isinstance(name, str) or not name.strip():
         return jsonify({"success": False, "error": "Brand name is required"}), 400
@@ -121,8 +150,11 @@ def create_brand():
     industry = (data.get("industry") or "").strip()
     primary_tone = (data.get("primary_tone") or "").strip()
     voice_traits = data.get("voice_traits", [])
-    if not isinstance(voice_traits, list) or not all(isinstance(item, str) for item in voice_traits):
+    if not isinstance(voice_traits, list):
         return jsonify({"success": False, "error": "Voice traits must be a list of strings"}), 400
+    voice_traits = validate_list_field(data, "voice_traits", max_items=20, item_type=str)
+    if any(len(item) > 100 for item in voice_traits):
+        return jsonify({"success": False, "error": "Each voice trait must be 100 characters or fewer"}), 400
     voice_traits = json.dumps(voice_traits)
     target_audience = data.get("target_audience") or ""
 
@@ -141,23 +173,37 @@ def create_brand():
             """, (brand_id, "[]", "[]", "[]", "", "", ""))
 
         return jsonify({"success": True, "brand_id": brand_id, "message": "Brand created successfully"})
-    except Exception as e:
-        logger.exception("Error creating brand: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as error:
+        logger.error(
+            "Error creating brand (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not create the brand."}), 500
 
 @brands_bp.route("/<int:brand_id>", methods=["PUT"])
 def update_brand(brand_id):
+    if not is_positive_int(brand_id):
+        return jsonify({"success": False, "error": "Brand not found"}), 404
     data = json_object_payload()
     validate_string_fields(
         data,
         ("name", "tagline", "description", "industry", "primary_tone", "target_audience"),
+        max_lengths={
+            "name": 200,
+            "tagline": 500,
+            "description": 5000,
+            "industry": 200,
+            "primary_tone": 200,
+            "target_audience": 1000,
+        },
     )
     if "name" in data and data["name"] is not None and not data["name"].strip():
         return jsonify({"success": False, "error": "Brand name cannot be empty"}), 400
     voice_traits = data.get("voice_traits")
     if isinstance(voice_traits, list):
-        if not all(isinstance(item, str) for item in voice_traits):
-            return jsonify({"success": False, "error": "Voice traits must contain only strings"}), 400
+        voice_traits = validate_list_field(data, "voice_traits", max_items=20, item_type=str)
+        if any(len(item) > 100 for item in voice_traits):
+            return jsonify({"success": False, "error": "Each voice trait must be 100 characters or fewer"}), 400
         voice_traits = json.dumps(voice_traits)
     elif voice_traits is not None:
         return jsonify({"success": False, "error": "Voice traits must be a list of strings"}), 400
@@ -184,15 +230,30 @@ def update_brand(brand_id):
             if cursor.rowcount == 0:
                 return jsonify({"success": False, "error": "Brand not found"}), 404
         return jsonify({"success": True, "message": "Brand updated successfully"})
-    except Exception as e:
-        logger.exception("Error updating brand: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error updating brand (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not update the brand."}), 500
 
 # Facts CRUD
 @brands_bp.route("/<int:brand_id>/facts", methods=["POST"])
 def add_fact(brand_id):
+    if not is_positive_int(brand_id):
+        return jsonify({"success": False, "error": "Brand not found"}), 404
     data = json_object_payload()
-    validate_string_fields(data, ("statement", "category", "key_metric", "keywords"))
+    validate_string_fields(
+        data,
+        ("statement", "category", "key_metric", "keywords"),
+        max_lengths={
+            "statement": 5000,
+            "category": 100,
+            "key_metric": 1000,
+            "keywords": 1000,
+        },
+    )
+    validate_required_fields(data, ("statement",))
     statement = (data.get("statement") or "").strip()
     if not statement:
         return jsonify({"success": False, "error": "Fact statement is required"}), 400
@@ -213,30 +274,52 @@ def add_fact(brand_id):
             """, (brand_id, category, statement, key_metric, keywords))
             fact_id = cursor.lastrowid
         return jsonify({"success": True, "fact_id": fact_id, "message": "Fact added successfully"})
-    except Exception as e:
-        logger.exception("Error adding fact: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error adding fact (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not add the brand fact."}), 500
 
 @brands_bp.route("/facts/<int:fact_id>", methods=["DELETE"])
 def delete_fact(fact_id):
+    if not is_positive_int(fact_id):
+        return jsonify({"success": False, "error": "Fact not found"}), 404
+    brand_id = validate_query_id("brand_id", required=True)
     try:
         with db_session() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM brand_facts WHERE id = ?", (fact_id,))
+            cursor.execute(
+                "DELETE FROM brand_facts WHERE id = ? AND brand_id = ?",
+                (fact_id, brand_id),
+            )
             if cursor.rowcount == 0:
                 return jsonify({"success": False, "error": "Fact not found"}), 404
         return jsonify({"success": True, "message": "Fact deleted"})
-    except Exception as e:
-        logger.exception("Error deleting fact: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error deleting fact (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not delete the brand fact."}), 500
 
 # Terminology CRUD
 @brands_bp.route("/<int:brand_id>/terminology", methods=["POST"])
 def add_terminology(brand_id):
+    if not is_positive_int(brand_id):
+        return jsonify({"success": False, "error": "Brand not found"}), 404
     data = json_object_payload()
     validate_string_fields(
         data,
         ("term", "replacement", "replacement_text", "reason", "category", "severity"),
+        max_lengths={
+            "term": 500,
+            "replacement": 1000,
+            "replacement_text": 1000,
+            "reason": 2000,
+            "category": 100,
+            "severity": 20,
+        },
     )
     term = data.get("term", "")
     if not isinstance(term, str):
@@ -285,26 +368,40 @@ def add_terminology(brand_id):
             """, (brand_id, term, legacy_replacement, replacement_text, reason, category, severity))
             term_id = cursor.lastrowid
         return jsonify({"success": True, "term_id": term_id, "message": "Terminology rule added"})
-    except Exception as e:
-        logger.exception("Error adding terminology: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error adding terminology (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not add the terminology rule."}), 500
 
 @brands_bp.route("/terminology/<int:term_id>", methods=["DELETE"])
 def delete_terminology(term_id):
+    if not is_positive_int(term_id):
+        return jsonify({"success": False, "error": "Terminology rule not found"}), 404
+    brand_id = validate_query_id("brand_id", required=True)
     try:
         with db_session() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM brand_terminology WHERE id = ?", (term_id,))
+            cursor.execute(
+                "DELETE FROM brand_terminology WHERE id = ? AND brand_id = ?",
+                (term_id, brand_id),
+            )
             if cursor.rowcount == 0:
                 return jsonify({"success": False, "error": "Terminology rule not found"}), 404
         return jsonify({"success": True, "message": "Terminology rule deleted"})
-    except Exception as e:
-        logger.exception("Error deleting terminology: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error deleting terminology (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not delete the terminology rule."}), 500
 
 # Visual Rules Update
 @brands_bp.route("/<int:brand_id>/visual-rules", methods=["PUT"])
 def update_visual_rules(brand_id):
+    if not is_positive_int(brand_id):
+        return jsonify({"success": False, "error": "Brand not found"}), 404
     data = json_object_payload()
     colors = [
         data.get("primary_colors", []),
@@ -313,6 +410,8 @@ def update_visual_rules(brand_id):
     ]
     if any(not isinstance(color_list, list) for color_list in colors):
         return jsonify({"success": False, "error": "Color guidelines must be lists"}), 400
+    for field_name in ("primary_colors", "secondary_colors", "forbidden_colors"):
+        validate_list_field(data, field_name, max_items=50, item_type=dict)
     for color_list in colors:
         for color in color_list:
             if (
@@ -322,12 +421,18 @@ def update_visual_rules(brand_id):
                 or not isinstance(color.get("hex"), str)
                 or not re.fullmatch(r"#[0-9a-f]{3}(?:[0-9a-f]{3})?", color["hex"], re.IGNORECASE)
                 or ("reason" in color and not isinstance(color["reason"], str))
+                or len(color.get("name", "")) > 100
+                or len(color.get("reason", "")) > 1000
             ):
                 return jsonify({
                     "success": False,
                     "error": "Each color must have a name, valid hex value, and optional string reason",
                 }), 400
-    validate_string_fields(data, ("logo_rules", "font_family", "contrast_minimum"))
+    validate_string_fields(
+        data,
+        ("logo_rules", "font_family", "contrast_minimum"),
+        max_lengths={"logo_rules": 2000, "font_family": 200, "contrast_minimum": 100},
+    )
     primary_colors, secondary_colors, forbidden_colors = map(json.dumps, colors)
     logo_rules = data.get("logo_rules") or ""
     font_family = data.get("font_family") or ""
@@ -352,13 +457,18 @@ def update_visual_rules(brand_id):
                     updated_at = CURRENT_TIMESTAMP
             """, (brand_id, primary_colors, secondary_colors, forbidden_colors, logo_rules, font_family, contrast_minimum))
         return jsonify({"success": True, "message": "Visual guidelines updated successfully"})
-    except Exception as e:
-        logger.exception("Error updating visual rules: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error updating visual rules (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not update visual guidelines."}), 500
 
 # Claim Rules CRUD
 @brands_bp.route("/<int:brand_id>/claims", methods=["POST"])
 def add_claim_rule(brand_id):
+    if not is_positive_int(brand_id):
+        return jsonify({"success": False, "error": "Brand not found"}), 404
     data = json_object_payload()
     validate_string_fields(
         data,
@@ -366,6 +476,15 @@ def add_claim_rule(brand_id):
             "rule_name", "pattern_or_trigger", "severity", "required_disclaimer",
             "replacement_text", "replacement", "explanation",
         ),
+        max_lengths={
+            "rule_name": 200,
+            "pattern_or_trigger": 512,
+            "severity": 20,
+            "required_disclaimer": 2000,
+            "replacement_text": 1000,
+            "replacement": 1000,
+            "explanation": 2000,
+        },
     )
     rule_name = data.get("rule_name", "")
     pattern = data.get("pattern_or_trigger", "")
@@ -411,19 +530,31 @@ def add_claim_rule(brand_id):
             """, (brand_id, rule_name, pattern, severity, disclaimer, replacement_text, explanation))
             rule_id = cursor.lastrowid
         return jsonify({"success": True, "rule_id": rule_id, "message": "Claim rule added"})
-    except Exception as e:
-        logger.exception("Error adding claim rule: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error adding claim rule (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not add the claim rule."}), 500
 
 @brands_bp.route("/claims/<int:claim_id>", methods=["DELETE"])
 def delete_claim_rule(claim_id):
+    if not is_positive_int(claim_id):
+        return jsonify({"success": False, "error": "Claim rule not found"}), 404
+    brand_id = validate_query_id("brand_id", required=True)
     try:
         with db_session() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM brand_claim_rules WHERE id = ?", (claim_id,))
+            cursor.execute(
+                "DELETE FROM brand_claim_rules WHERE id = ? AND brand_id = ?",
+                (claim_id, brand_id),
+            )
             if cursor.rowcount == 0:
                 return jsonify({"success": False, "error": "Claim rule not found"}), 404
         return jsonify({"success": True, "message": "Claim rule deleted"})
-    except Exception as e:
-        logger.exception("Error deleting claim rule: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error deleting claim rule (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not delete the claim rule."}), 500

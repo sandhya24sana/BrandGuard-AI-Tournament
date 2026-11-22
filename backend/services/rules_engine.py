@@ -1,12 +1,120 @@
 
+import json
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 
 from services.correction_engine import (
     apply_corrections,
     legacy_claim_replacement,
     legacy_terminology_replacement,
     safe_replacement_text,
+)
+
+_FACT_STOP_WORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "been", "being", "by",
+    "can't", "cannot", "do", "does", "don't", "doesn't", "for", "from",
+    "has", "hasn't", "have", "haven't", "in", "into", "is", "isn't", "it",
+    "its", "never", "no", "not", "of", "on", "or", "our", "the", "their",
+    "this", "to", "was", "wasn't", "were", "weren't", "with", "without",
+    "won't",
+})
+_FACT_CONTEXT_WORDS = frozenset({
+    "brand", "business", "company", "device", "formula", "organization",
+    "platform", "product", "service", "system", "team",
+})
+_FACT_NEGATION = re.compile(
+    r"\b(?:no|not|never|without|cannot|can't|don't|doesn't|isn't|aren't|"
+    r"wasn't|weren't|won't|hasn't|haven't|free\s+from|free\s+of)\b",
+    re.IGNORECASE,
+)
+_FACT_OPPOSITES = (
+    (r"\bnatural\b", r"\b(?:synthetic|artificial)\b"),
+    (r"\bsynthetic\b", r"\b(?:natural|organic)\b"),
+    (r"\bavailable\b", r"\b(?:unavailable|out\s+of\s+stock)\b"),
+    (r"\bapproved\b", r"\b(?:unapproved|rejected|not\s+approved)\b"),
+    (r"\ballowed\b", r"\b(?:prohibited|forbidden|not\s+allowed)\b"),
+    (r"\bactive\b", r"\binactive\b"),
+    (r"\bsupports?\b", r"\bopposes?\b"),
+)
+_FACT_VALUE_RELATION = re.compile(
+    r"\b(?P<relation>based\s+in|located\s+in|headquartered\s+in|"
+    r"founded\s+in|made\s+in|manufactured\s+in|produced\s+in)\s+"
+    r"(?P<value>[^.!?;\n]+)",
+    re.IGNORECASE,
+)
+_VOICE_TRAIT_RULES = (
+    (
+        ("warm", "friendly", "approachable", "empathetic", "supportive"),
+        r"\b(?:cold|hostile|rude|dismissive|uncaring)\b",
+        "This wording conflicts with the configured warm, friendly voice.",
+        "Use respectful, welcoming language that fits the configured voice.",
+    ),
+    (
+        ("calm", "reassuring", "measured"),
+        r"\b(?:act\s+now|hurry|urgent(?:ly)?|immediately|don't\s+miss\s+out)\b",
+        "This urgency conflicts with the configured calm, reassuring voice.",
+        "Replace pressure language with measured, informative wording.",
+    ),
+    (
+        ("confident", "decisive"),
+        r"\b(?:maybe|perhaps|possibly|might|i\s+guess|sort\s+of|kind\s+of)\b",
+        "This hedge may conflict with the configured confident, decisive voice.",
+        "State only verified conclusions directly, without unnecessary hedging.",
+    ),
+    (
+        ("concise", "brief", "direct"),
+        r"\b(?:in\s+order\s+to|at\s+this\s+point\s+in\s+time|"
+        r"it\s+is\s+important\s+to\s+note\s+that|with\s+regard\s+to)\b",
+        "This filler phrase conflicts with the configured concise, direct voice.",
+        "Remove the filler phrase while preserving the intended meaning.",
+    ),
+    (
+        ("precise", "evidence-based", "fact-based"),
+        r"\b(?:guaranteed?|proven|always|never|100\s*%)\b",
+        "This absolute wording may conflict with the configured evidence-based voice.",
+        "Verify the statement is supported by an approved fact or qualify it.",
+    ),
+    (
+        ("accessible", "clear", "plain-language", "plain language", "simple"),
+        r"\b(?:idempotent|stochastic|orthogonal|amortization|"
+        r"kubernetes|latency|api)\b",
+        "This technical term may conflict with the configured accessible voice.",
+        "Define the term or replace it with plain-language wording.",
+    ),
+)
+_AUDIENCE_GROUPS = (
+    ("children", r"\b(?:children|kids|minors)\b"),
+    ("parents", r"\bparents?\b"),
+    ("consumers", r"\b(?:consumers?|customers?|everyday\s+users?)\b"),
+    (
+        "professionals",
+        r"\b(?:medical\s+)?(?:professionals?|clinicians?|doctors?|nurses?|"
+        r"researchers?|research\s+teams?)\b",
+    ),
+    (
+        "technical users",
+        r"\b(?:developers?|engineers?|programmers?|software\s+teams?)\b",
+    ),
+    ("students", r"\b(?:students?|teachers?|educators?)\b"),
+    (
+        "business leaders",
+        r"\b(?:executives?|business\s+owners?|managers?)\b",
+    ),
+    (
+        "general audience",
+        r"\b(?:general\s+(?:audience|public)|non[- ]specialists?|"
+        r"beginners?|non[- ]technical\s+users?)\b",
+    ),
+)
+_NON_SPECIALIST_AUDIENCE = re.compile(
+    r"\b(?:general\s+(?:audience|public)|non[- ]specialists?|beginners?|"
+    r"non[- ]technical\s+users?|everyday\s+users?|consumers?)\b",
+    re.IGNORECASE,
+)
+_AUDIENCE_JARGON = re.compile(
+    r"\b(?:idempotent|stochastic|orthogonal|amortization|"
+    r"kubernetes|latency|api)\b",
+    re.IGNORECASE,
 )
 
 
@@ -27,6 +135,24 @@ def validate_claim_pattern(pattern: str) -> None:
         re.compile(pattern)
     except re.error as error:
         raise ValueError(f"Invalid claim pattern: {error}") from error
+
+
+def _claim_pattern_variants(rule: Dict[str, Any], pattern: str) -> List[str]:
+    rule_name = str(rule.get("rule_name") or "").casefold()
+    is_medical_claim = "medical" in rule_name and "claim" in rule_name
+    is_health_claim = "health" in rule_name and "claim" in rule_name
+
+    if is_medical_claim or is_health_claim:
+        # Normalize legacy stored alternatives in memory; do not rewrite saved rules.
+        pattern = pattern.replace(r"\|", "|")
+
+    patterns = [pattern]
+    if is_medical_claim:
+        patterns.append(
+            r"\b(?:cure|treat|prevent)s?(?:\s+(?:diseases?|health problems?))?\b"
+        )
+
+    return list(dict.fromkeys(patterns))
 
 
 class RuleBasedAnalyzer:
@@ -68,6 +194,9 @@ class RuleBasedAnalyzer:
         tone_issues, tone_penalty = self._check_tone(text, content_type)
         issues.extend(tone_issues)
 
+        audience_issues, audience_penalty = self._check_audience(text)
+        issues.extend(audience_issues)
+
         claim_issues, claim_penalty = self._check_claims(text)
         issues.extend(claim_issues)
 
@@ -80,7 +209,9 @@ class RuleBasedAnalyzer:
         score_facts = max(0, 100 - fact_penalty)
         score_tone = max(0, 100 - tone_penalty)
         score_claims = max(0, 100 - claim_penalty)
-        score_accessibility = max(0, 100 - access_penalty)
+        score_accessibility = max(
+            0, 100 - access_penalty - audience_penalty
+        )
 
         category_scores = {
             "Terminology": "terminology",
@@ -158,6 +289,186 @@ class RuleBasedAnalyzer:
             "corrected_text": corrected_text,
             "engine_used": "RULE_BASED_FALLBACK",
         }
+
+    @staticmethod
+    def _configured_values(value: Any) -> List[str]:
+        if isinstance(value, list):
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()]
+        if not isinstance(value, str) or not value.strip():
+            return []
+
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [
+                item.strip()
+                for item in parsed
+                if isinstance(item, str) and item.strip()
+            ]
+        if isinstance(parsed, str) and parsed.strip():
+            return [parsed.strip()]
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    @staticmethod
+    def _term_pattern(term: str) -> re.Pattern:
+        escaped = re.escape(term.strip()).replace(r"\ ", r"\s+")
+        return re.compile(rf"(?<!\w){escaped}(?!\w)", re.IGNORECASE)
+
+    @classmethod
+    def _fact_terms(cls, statement: str, configured_keywords: List[str]) -> List[str]:
+        if configured_keywords:
+            return list(dict.fromkeys(configured_keywords))
+        return list(dict.fromkeys(
+            token
+            for token in re.findall(r"[\w'-]+", statement, re.UNICODE)
+            if len(token) >= 3 and token.casefold() not in _FACT_STOP_WORDS
+        ))
+
+    @classmethod
+    def _has_fact_evidence(
+        cls,
+        sentence: str,
+        terms: List[str],
+    ) -> bool:
+        matched_terms = {
+            term.casefold()
+            for term in terms
+            if cls._term_pattern(term).search(sentence)
+        }
+        return bool(matched_terms)
+
+    @staticmethod
+    def _is_negated_near(text: str, start: int) -> bool:
+        tokens = list(re.finditer(r"[\w']+", text, re.UNICODE))
+        anchor_index = next(
+            (index for index, token in enumerate(tokens) if token.start() >= start),
+            len(tokens),
+        )
+        first = max(0, anchor_index - 3)
+        window = tokens[first:min(len(tokens), anchor_index + 2)]
+        for index, token in enumerate(window):
+            if token.group(0).casefold() == "not":
+                following = window[index + 1].group(0).casefold() if index + 1 < len(window) else ""
+                if following == "only":
+                    continue
+            if _FACT_NEGATION.fullmatch(token.group(0)):
+                return True
+            if token.group(0).casefold() == "free" and index + 1 < len(window):
+                if window[index + 1].group(0).casefold() in {"from", "of"}:
+                    return True
+        return False
+
+    @classmethod
+    def _fact_contradiction(
+        cls,
+        statement: str,
+        sentence: str,
+    ) -> Optional[Tuple[str, int, int]]:
+        approved_relations = list(_FACT_VALUE_RELATION.finditer(statement))
+        stated_relations = list(_FACT_VALUE_RELATION.finditer(sentence))
+        for approved in approved_relations:
+            approved_value = re.split(
+                r"\b(?:and|but|because|while|which)\b",
+                approved.group("value"),
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip(" ,")
+            approved_tokens = {
+                token.casefold()
+                for token in re.findall(r"[\w'-]+", approved_value, re.UNICODE)
+                if token.casefold() not in _FACT_STOP_WORDS
+            }
+            for stated in stated_relations:
+                if approved.group("relation").casefold() != stated.group("relation").casefold():
+                    continue
+                stated_value = re.split(
+                    r"\b(?:and|but|because|while|which)\b",
+                    stated.group("value"),
+                    maxsplit=1,
+                    flags=re.IGNORECASE,
+                )[0].strip(" ,")
+                stated_tokens = {
+                    token.casefold()
+                    for token in re.findall(r"[\w'-]+", stated_value, re.UNICODE)
+                    if token.casefold() not in _FACT_STOP_WORDS
+                }
+                if (
+                    approved_tokens
+                    and stated_tokens
+                    and not approved_tokens.issubset(stated_tokens)
+                    and not stated_tokens.issubset(approved_tokens)
+                ):
+                    value_start, value_end = stated.span("value")
+                    leading = len(stated.group("value")) - len(
+                        stated.group("value").lstrip()
+                    )
+                    value_start += leading
+                    value_end = value_start + len(stated_value)
+                    return (
+                        sentence[value_start:value_end],
+                        value_start,
+                        value_end,
+                    )
+
+        statement_tokens = [
+            token for token in re.findall(r"[\w'-]+", statement, re.UNICODE)
+            if (
+                len(token) >= 3
+                and token.casefold() not in _FACT_STOP_WORDS
+                and token.casefold() not in _FACT_CONTEXT_WORDS
+            )
+        ]
+        for token in dict.fromkeys(statement_tokens):
+            pattern = cls._term_pattern(token)
+            approved_matches = list(pattern.finditer(statement))
+            stated_matches = list(pattern.finditer(sentence))
+            for approved_match in approved_matches:
+                approved_negated = cls._is_negated_near(
+                    statement, approved_match.start()
+                )
+                for stated_match in stated_matches:
+                    stated_negated = cls._is_negated_near(
+                        sentence, stated_match.start()
+                    )
+                    if approved_negated != stated_negated:
+                        return (
+                            stated_match.group(0),
+                            stated_match.start(),
+                            stated_match.end(),
+                        )
+
+        for approved_pattern, contrary_pattern in _FACT_OPPOSITES:
+            approved_match = re.search(approved_pattern, statement, re.IGNORECASE)
+            contrary_match = re.search(contrary_pattern, sentence, re.IGNORECASE)
+            if (
+                approved_match
+                and contrary_match
+                and not re.search(approved_pattern, sentence, re.IGNORECASE)
+            ):
+                return (
+                    contrary_match.group(0),
+                    contrary_match.start(),
+                    contrary_match.end(),
+                )
+            contrary_approved = re.search(
+                contrary_pattern, statement, re.IGNORECASE
+            )
+            approved_in_sentence = re.search(
+                approved_pattern, sentence, re.IGNORECASE
+            )
+            if (
+                contrary_approved
+                and approved_in_sentence
+                and not re.search(contrary_pattern, sentence, re.IGNORECASE)
+            ):
+                return (
+                    approved_in_sentence.group(0),
+                    approved_in_sentence.start(),
+                    approved_in_sentence.end(),
+                )
+        return None
 
     def _check_terminology(
         self, text: str
@@ -239,12 +550,8 @@ class RuleBasedAnalyzer:
         for fact in self.facts:
             statement = (fact.get("statement") or "").strip()
             key_metric = (fact.get("key_metric") or "").strip()
-
-            keywords = [
-                keyword.strip().lower()
-                for keyword in (fact.get("keywords") or "").split(",")
-                if keyword.strip()
-            ]
+            keywords = self._configured_values(fact.get("keywords"))
+            fact_terms = self._fact_terms(statement, keywords)
 
             approved_values = {}
 
@@ -258,78 +565,85 @@ class RuleBasedAnalyzer:
 
             approved_numbers = set(approved_values)
 
-            if not statement or not keywords or not approved_numbers:
+            if not statement or not fact_terms:
                 continue
 
             for sentence, offset in sentences:
-                lowered_sentence = sentence.lower()
-
-                if not any(
-                    keyword in lowered_sentence for keyword in keywords
+                if not self._has_fact_evidence(
+                    sentence, fact_terms
                 ):
                     continue
 
                 stated_matches = list(number_pattern.finditer(sentence))
 
-                normalized_stated = {
-                    match.group(0).replace(",", "").rstrip("%+")
-                    for match in stated_matches
-                }
-
-                if (
-                    not normalized_stated
-                    or normalized_stated.issubset(approved_numbers)
-                ):
-                    continue
-
                 conflicting_matches = [
-                    match
-                    for match in stated_matches
+                    match for match in stated_matches
                     if match.group(0).replace(",", "").rstrip("%+")
                     not in approved_numbers
                 ]
+                if approved_numbers and conflicting_matches:
+                    match = conflicting_matches[0]
+                    start = offset + match.start()
+                    end = offset + match.end()
+                    replacement = (
+                        next(iter(approved_values.values()))
+                        if len(approved_values) == 1
+                        else ""
+                    )
+                    replacement = safe_replacement_text(
+                        replacement, match.group(0)
+                    )
+                    penalty += 25
+                    issues.append({
+                        "id": f"fact_{fact.get('id', len(issues))}_{start}",
+                        "category": "Fact Accuracy",
+                        "severity": "WARNING",
+                        "rule": f"Approved Fact: {fact.get('category') or 'Brand fact'}",
+                        "matched_text": match.group(0),
+                        "location": {"start": start, "end": end},
+                        "explanation": (
+                            "This numeric claim conflicts with the "
+                            "approved fact configured for this brand."
+                        ),
+                        "suggestion": replacement or "",
+                        "replacement_text": replacement,
+                        "approved_fact": statement,
+                        "auto_fixable": replacement is not None,
+                        "manual_review_required": replacement is None,
+                    })
+                    break
 
-                if not conflicting_matches:
-                    continue
-
-                match = conflicting_matches[0]
-                start = offset + match.start()
-                end = offset + match.end()
-
-                replacement = (
-                    next(iter(approved_values.values()))
-                    if len(approved_values) == 1
-                    else ""
+                contradiction = self._fact_contradiction(
+                    statement, sentence
                 )
-
-                replacement = safe_replacement_text(
-                    replacement, match.group(0)
-                )
-
-                penalty += 25
-
-                issues.append({
-                    "id": f"fact_{fact.get('id', len(issues))}_{start}",
-                    "category": "Fact Accuracy",
-                    "severity": "WARNING",
-                    "rule": (
-                        f"Approved Fact: "
-                        f"{fact.get('category') or 'Brand fact'}"
-                    ),
-                    "matched_text": match.group(0),
-                    "location": {"start": start, "end": end},
-                    "explanation": (
-                        "This numeric claim conflicts with the "
-                        "approved fact configured for this brand."
-                    ),
-                    "suggestion": replacement or "",
-                    "replacement_text": replacement,
-                    "approved_fact": statement,
-                    "auto_fixable": replacement is not None,
-                    "manual_review_required": replacement is None,
-                })
-
-                break
+                if contradiction:
+                    matched_text, start, end = contradiction
+                    penalty += 25
+                    issues.append({
+                        "id": f"fact_{fact.get('id', len(issues))}_{offset + start}",
+                        "category": "Fact Accuracy",
+                        "severity": "WARNING",
+                        "rule": f"Approved Fact: {fact.get('category') or 'Brand fact'}",
+                        "matched_text": matched_text,
+                        "location": {
+                            "start": offset + start,
+                            "end": offset + end,
+                        },
+                        "explanation": (
+                            "This wording appears to contradict the "
+                            "approved brand fact. Verify it against the "
+                            "configured statement."
+                        ),
+                        "suggestion": (
+                            "Review the claim against the approved fact; "
+                            "no automatic replacement is safe."
+                        ),
+                        "replacement_text": None,
+                        "approved_fact": statement,
+                        "auto_fixable": False,
+                        "manual_review_required": True,
+                    })
+                    break
 
         return issues, min(100, penalty)
 
@@ -343,21 +657,8 @@ class RuleBasedAnalyzer:
             self.brand.get("primary_tone") or ""
         ).lower()
 
-        voice_traits = self.brand.get("voice_traits") or []
-
-        if isinstance(voice_traits, str):
-            try:
-                import json
-                voice_traits = json.loads(voice_traits)
-            except json.JSONDecodeError:
-                voice_traits = []
-
-        if isinstance(voice_traits, list):
-            tone_profile += " " + " ".join(
-                trait.lower()
-                for trait in voice_traits
-                if isinstance(trait, str)
-            )
+        voice_traits = self._configured_values(self.brand.get("voice_traits"))
+        tone_profile += " " + " ".join(voice_traits).lower()
 
         slang_patterns = []
 
@@ -419,6 +720,63 @@ class RuleBasedAnalyzer:
                     "manual_review_required": True,
                 })
 
+        existing_spans = {
+            (
+                issue["location"]["start"],
+                issue["location"]["end"],
+            )
+            for issue in issues
+            if isinstance(issue.get("location"), dict)
+        }
+        for trait_index, (aliases, pattern, explanation, suggestion) in enumerate(
+            _VOICE_TRAIT_RULES
+        ):
+            matched_trait = next(
+                (
+                    trait for trait in voice_traits
+                    if any(
+                        re.search(
+                            rf"(?<!\w){re.escape(alias)}(?!\w)",
+                            trait,
+                            re.IGNORECASE,
+                        )
+                        for alias in aliases
+                    )
+                ),
+                next(
+                    (
+                        alias for alias in aliases
+                        if re.search(
+                            rf"(?<!\w){re.escape(alias)}(?!\w)",
+                            tone_profile,
+                            re.IGNORECASE,
+                        )
+                    ),
+                    None,
+                ),
+            )
+            if not matched_trait:
+                continue
+            for match in re.finditer(pattern, text, re.IGNORECASE):
+                start, end = match.span()
+                if (start, end) in existing_spans:
+                    continue
+                issues.append({
+                    "id": f"voice_trait_{trait_index}_{start}_{end}",
+                    "category": "Voice & Tone",
+                    "severity": "WARNING",
+                    "rule": f"Configured Voice Trait: {matched_trait}",
+                    "matched_text": match.group(0),
+                    "location": {"start": start, "end": end},
+                    "explanation": explanation,
+                    "suggestion": suggestion,
+                    "replacement_text": None,
+                    "auto_fixable": False,
+                    "manual_review_required": True,
+                })
+                existing_spans.add((start, end))
+                penalty += 10
+
         exclamation_matches = list(re.finditer(r"!{2,}", text))
 
         if exclamation_matches:
@@ -468,6 +826,85 @@ class RuleBasedAnalyzer:
 
         return issues, min(100, penalty)
 
+    def _check_audience(
+        self, text: str
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        audience = self.brand.get("target_audience")
+        if not isinstance(audience, str) or not audience.strip():
+            return [], 0
+
+        configured_groups = {
+            group
+            for group, pattern in _AUDIENCE_GROUPS
+            if re.search(pattern, audience, re.IGNORECASE)
+        }
+        issues = []
+        penalty = 0
+        seen_spans = set()
+
+        if configured_groups:
+            for group, pattern in _AUDIENCE_GROUPS:
+                if group in configured_groups:
+                    continue
+                direct_address = re.compile(
+                    rf"\b(?:for|to|dear)\s+(?:the\s+)?(?:{pattern})",
+                    re.IGNORECASE,
+                )
+                for match in direct_address.finditer(text):
+                    if match.span() in seen_spans:
+                        continue
+                    seen_spans.add(match.span())
+                    issues.append({
+                        "id": f"audience_{match.start()}_{match.end()}",
+                        "category": "Accessibility & Clarity",
+                        "severity": "WARNING",
+                        "rule": "Target Audience Suitability",
+                        "matched_text": match.group(0),
+                        "location": {
+                            "start": match.start(),
+                            "end": match.end(),
+                        },
+                        "explanation": (
+                            f"The content explicitly addresses {group}, "
+                            f"which does not match the configured audience "
+                            f"({audience.strip()})."
+                        ),
+                        "suggestion": (
+                            "Address the configured audience, or verify "
+                            "that the target audience setting is correct."
+                        ),
+                        "replacement_text": None,
+                        "auto_fixable": False,
+                        "manual_review_required": True,
+                    })
+                    penalty += 15
+
+        if _NON_SPECIALIST_AUDIENCE.search(audience):
+            match = _AUDIENCE_JARGON.search(text)
+            if match:
+                issues.append({
+                    "id": f"audience_jargon_{match.start()}_{match.end()}",
+                    "category": "Accessibility & Clarity",
+                    "severity": "WARNING",
+                    "rule": "Target Audience Suitability",
+                    "matched_text": match.group(0),
+                    "location": {"start": match.start(), "end": match.end()},
+                    "explanation": (
+                        "This technical term may be unclear to the configured "
+                        "non-specialist audience."
+                    ),
+                    "suggestion": (
+                        "Define the term or replace it with plain-language "
+                        "wording appropriate for the audience."
+                    ),
+                    "replacement_text": None,
+                    "auto_fixable": False,
+                    "manual_review_required": True,
+                })
+                penalty += 10
+
+        return issues, min(100, penalty)
+
     def _check_claims(
         self, text: str
     ) -> Tuple[List[Dict[str, Any]], int]:
@@ -486,20 +923,34 @@ class RuleBasedAnalyzer:
             if not pattern_str:
                 continue
 
-            validate_claim_pattern(pattern_str)
+            patterns = _claim_pattern_variants(rule, pattern_str)
+            for pattern in patterns:
+                validate_claim_pattern(pattern)
 
             try:
-                for match in re.finditer(
-                    pattern_str, text, re.IGNORECASE
-                ):
-                    start, end = match.span()
+                matches = {}
+                for pattern in patterns:
+                    for match in re.finditer(pattern, text, re.IGNORECASE):
+                        matches.setdefault(match.span(), match.group(0))
+
+                maximal_matches = {
+                    span: matched_text
+                    for span, matched_text in matches.items()
+                    if not any(
+                        other_span != span
+                        and other_span[0] <= span[0]
+                        and span[1] <= other_span[1]
+                        for other_span in matches
+                    )
+                }
+                for (start, end), matched_text in sorted(maximal_matches.items()):
                     severity = (
                         rule.get("severity") or "critical"
                     ).upper()
 
                     replacement = safe_replacement_text(
                         legacy_claim_replacement(rule),
-                        match.group(0),
+                        matched_text,
                     )
 
                     penalty += 30 if severity == "CRITICAL" else 15
@@ -511,7 +962,7 @@ class RuleBasedAnalyzer:
                         "rule": rule.get(
                             "rule_name", "Regulatory Compliance"
                         ),
-                        "matched_text": match.group(0),
+                        "matched_text": matched_text,
                         "location": {"start": start, "end": end},
                         "explanation": (
                             rule.get("explanation")
@@ -749,6 +1200,9 @@ class RuleBasedAnalyzer:
         """Build a preview using only validated, exact-span replacements."""
 
         correction_plan = apply_corrections(text, issues)
+        conflicting_issue_ids = set(
+            correction_plan.get("conflicting_issue_ids", [])
+        )
 
         for issue in issues:
             reason = correction_plan["manual_review"].get(
@@ -759,6 +1213,8 @@ class RuleBasedAnalyzer:
                 issue["auto_fixable"] = False
                 issue["manual_review_required"] = True
                 issue["manual_review_reason"] = reason
+                if issue.get("id") in conflicting_issue_ids:
+                    issue["replacement_choice_required"] = True
 
         return correction_plan["text"]
 

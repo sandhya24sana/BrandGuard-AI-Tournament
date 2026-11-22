@@ -5,14 +5,16 @@ import logging
 from flask import Flask, jsonify, request, send_from_directory
 from werkzeug.exceptions import HTTPException
 from flask_cors import CORS
+from flask_limiter.errors import RateLimitExceeded
 
 # Ensure backend directory is in Python path
 backend_dir = os.path.dirname(os.path.abspath(__file__))
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
-from config import Config
+from config import Config, configure_rate_limit_storage
 from database import init_db
+from extensions import limiter
 
 from routes.brands import brands_bp
 from routes.content import content_bp
@@ -36,7 +38,9 @@ def create_app(test_config=None):
     if test_config:
         app.config.update(test_config)
 
+    configure_rate_limit_storage(app.config)
     CORS(app, resources={r"/api/*": {"origins": Config.CORS_ORIGINS}})
+    limiter.init_app(app)
 
     # Initialize database WITHOUT inserting demo data
     with app.app_context():
@@ -134,10 +138,22 @@ def create_app(test_config=None):
         }), 405
 
     # Internal server error
+    @app.errorhandler(RateLimitExceeded)
+    def rate_limit_exceeded(_error):
+
+        return jsonify({
+            "success": False,
+            "error": "Too many requests. Please try again later.",
+        }), 429
+
+    # Internal server error
     @app.errorhandler(500)
     def internal_error(e):
 
-        logger.exception("Internal server error: %s", str(e))
+        logger.error(
+            "Internal server error (exception_category=%s)",
+            type(e).__name__,
+        )
 
         return jsonify({
             "success": False,
@@ -154,7 +170,10 @@ def create_app(test_config=None):
                 "error": e.description
             }), e.code
 
-        logger.exception("Unhandled exception: %s", str(e))
+        logger.error(
+            "Unhandled exception (exception_category=%s)",
+            type(e).__name__,
+        )
 
         return jsonify({
             "success": False,

@@ -1,10 +1,15 @@
 import React from 'react';
 import { AlertCircle, AlertTriangle, Info, Check, Sparkles } from 'lucide-react';
 
-export default function IssueCard({ issue, onApplyFix, isApplyingFix = false }) {
-  const isCritical = issue.severity === 'CRITICAL';
-  const isWarning = issue.severity === 'WARNING';
-
+export default function IssueCard({
+  issue,
+  sourceText,
+  onApplyFix,
+  selectedReplacementOptionId,
+  onReplacementOptionChange,
+  isApplyingFix = false,
+  isAuditStale = false
+}) {
   const severityConfig = {
     CRITICAL: {
       border: 'border-slate-200 hover:border-slate-300',
@@ -29,9 +34,42 @@ export default function IssueCard({ issue, onApplyFix, isApplyingFix = false }) 
   const config = severityConfig[issue.severity] || severityConfig.INFO;
   const Icon = config.icon;
   const suggestion = issue.replacement_text || issue.suggestion;
-  const canApplyFix = issue.auto_fixable === true
-    && typeof issue.replacement_text === 'string'
-    && Boolean(issue.replacement_text.trim());
+  const replacementText = issue.replacement_text;
+  const replacementOptions = Array.isArray(issue.replacement_options)
+    ? issue.replacement_options.filter((option) => (
+      option
+      && typeof option.issue_id === 'string'
+      && typeof option.replacement_text === 'string'
+      && Boolean(option.replacement_text.trim())
+      && option.replacement_text.trim().length <= 1000
+    ))
+    : [];
+  const hasReplacementChoices = replacementOptions.length > 1;
+  const selectedOptionId = hasReplacementChoices
+    && replacementOptions.some((option) => option.issue_id === selectedReplacementOptionId)
+    ? selectedReplacementOptionId
+    : '';
+  const location = issue.location;
+  const hasCurrentMatch = typeof sourceText === 'string'
+    && typeof issue.matched_text === 'string'
+    && Number.isInteger(location?.start)
+    && Number.isInteger(location?.end)
+    && location.start >= 0
+    && location.end > location.start
+    && Array.from(sourceText).slice(location.start, location.end).join('') === issue.matched_text;
+  const validSingleReplacement = issue.auto_fixable === true
+    && typeof issue.matched_text === 'string'
+    && typeof replacementText === 'string'
+    && Boolean(replacementText.trim())
+    && replacementText.trim().length <= 1000
+    && !/^[\s]*(?:avoid\b|do not\b|don't\b|use\s*:|add\s+(?:a\s+)?disclaimer\b|required disclaimer\b|compliance explanation\b|policy rationale\b)/i.test(replacementText)
+    && replacementText.trim().toLowerCase() !== issue.matched_text?.trim().toLowerCase();
+  const canApplyFix = hasCurrentMatch && (
+    hasReplacementChoices || validSingleReplacement
+  ) && !isAuditStale && !(
+    issue.manual_review_required === true
+    && issue.replacement_choice_required !== true
+  );
 
   return (
     <div className={`p-4 rounded-xl border border-l-3 bg-white ${config.accent} ${config.border} shadow-xs transition-all`}>
@@ -71,14 +109,41 @@ export default function IssueCard({ issue, onApplyFix, isApplyingFix = false }) 
         <div className="pt-2.5 border-t border-slate-100 flex items-center justify-between gap-3 flex-wrap">
           <div className="flex items-center gap-1.5 text-xs text-emerald-700 flex-1 min-w-[200px]">
             <Sparkles className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
-            <span className="text-slate-500 font-medium">Recommended:</span>
-            <span className="font-semibold text-emerald-800">"{suggestion}"</span>
+            {hasReplacementChoices ? (
+              <>
+                <label htmlFor={`replacement-choice-${issue.id}`} className="text-slate-500 font-medium">
+                  Choose replacement:
+                </label>
+                <select
+                  id={`replacement-choice-${issue.id}`}
+                  value={selectedOptionId}
+                  onChange={(event) => onReplacementOptionChange?.(issue.id, event.target.value)}
+                  disabled={!hasCurrentMatch || isApplyingFix}
+                  className="min-w-0 max-w-full rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700"
+                >
+                  <option value="" disabled>Choose a safe replacement...</option>
+                  {replacementOptions.map((option) => (
+                    <option key={option.issue_id} value={option.issue_id}>
+                      {option.replacement_text}{option.rule ? ` — ${option.rule}` : ''}
+                    </option>
+                  ))}
+                </select>
+              </>
+            ) : (
+              <>
+                <span className="text-slate-500 font-medium">Recommended:</span>
+                <span className="font-semibold text-emerald-800">"{suggestion}"</span>
+              </>
+            )}
           </div>
 
           {canApplyFix && onApplyFix && (
             <button
-              onClick={() => onApplyFix(issue)}
-              disabled={isApplyingFix}
+              onClick={() => onApplyFix(
+                issue,
+                hasReplacementChoices ? selectedOptionId : issue.id
+              )}
+              disabled={isApplyingFix || (hasReplacementChoices && !selectedOptionId)}
               className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border border-emerald-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               title="Replace the exact matched text"
             >

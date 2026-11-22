@@ -145,7 +145,7 @@ export default function GuidelinesManager({ brandId, onBrandUpdated, onDeleteBra
   const handleDeleteFact = async (factId) => {
     if (!confirm('Are you sure you want to delete this fact?')) return;
     try {
-      const res = await api.deleteFact(factId);
+      const res = await api.deleteFact(factId, brandId);
       if (!res.success) throw new Error(res.error || 'Could not delete the fact.');
       showToast('Fact deleted.');
       await loadBrandDetails();
@@ -157,7 +157,7 @@ export default function GuidelinesManager({ brandId, onBrandUpdated, onDeleteBra
   const handleDeleteTerminology = async (termId) => {
     if (!confirm('Are you sure you want to delete this terminology rule?')) return;
     try {
-      const res = await api.deleteTerminology(termId);
+      const res = await api.deleteTerminology(termId, brandId);
       if (!res.success) throw new Error(res.error || 'Could not delete the terminology rule.');
       showToast('Terminology rule deleted.');
       await loadBrandDetails();
@@ -169,7 +169,7 @@ export default function GuidelinesManager({ brandId, onBrandUpdated, onDeleteBra
   const handleDeleteClaim = async (claimId) => {
     if (!confirm('Are you sure you want to delete this claim rule?')) return;
     try {
-      const res = await api.deleteClaimRule(claimId);
+      const res = await api.deleteClaimRule(claimId, brandId);
       if (!res.success) throw new Error(res.error || 'Could not delete the claim rule.');
       showToast('Claim rule deleted.');
       await loadBrandDetails();
@@ -565,7 +565,7 @@ export default function GuidelinesManager({ brandId, onBrandUpdated, onDeleteBra
             </div>
           </div>
           <p className="text-[11px] text-slate-500">
-            These visual guidelines are saved for reference. Image and layout validation is not implemented.
+            Uploaded images can be reviewed for obvious color conflicts and required logo-like mark presence. Exact colors, logo identity and spacing, fonts, contrast, and layout still require manual review.
           </p>
         </div>
       )}

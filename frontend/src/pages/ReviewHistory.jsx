@@ -1,16 +1,31 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { 
-  CheckSquare, CheckCircle2, AlertTriangle, RotateCcw, Clock, 
+  CheckSquare, CheckCircle2, AlertTriangle, RotateCcw, Clock, Pencil,
   Download, Eye, X, ChevronRight, XCircle 
 } from 'lucide-react';
 import { api } from '../api';
 import DiffViewer from '../components/DiffViewer';
 
+function getSavedVersions(detail) {
+  return (Array.isArray(detail?.versions) ? detail.versions : [])
+    .filter((version) => (
+      Number.isInteger(version.version_number) &&
+      version.version_number > 0 &&
+      typeof version.text === 'string'
+    ))
+    .sort((left, right) => left.version_number - right.version_number);
+}
+
+function formatVersionDate(value) {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'Timestamp unavailable' : date.toLocaleString();
+}
+
 export default function ReviewHistory({
   brandId,
   initialContentId,
   onInitialContentHandled,
-  onSelectContentToAnalyze
+  onEditContent
 }) {
   const [items, setItems] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -20,7 +35,22 @@ export default function ReviewHistory({
   const [detailModalOpen, setDetailModalOpen] = useState(false);
   const [activeModalTab, setActiveModalTab] = useState('versions');
   const [detailError, setDetailError] = useState('');
+  const [comparisonLeftVersion, setComparisonLeftVersion] = useState('');
+  const [comparisonRightVersion, setComparisonRightVersion] = useState('');
   const detailRequestId = useRef(0);
+
+  const selectContentDetail = (detail) => {
+    const versions = getSavedVersions(detail).sort(
+      (left, right) => right.version_number - left.version_number
+    );
+    setSelectedDetail(detail);
+    setComparisonLeftVersion(
+      versions.length > 1 ? String(versions[1].version_number) : ''
+    );
+    setComparisonRightVersion(
+      versions.length > 0 ? String(versions[0].version_number) : ''
+    );
+  };
 
   useEffect(() => {
     let active = true;
@@ -53,13 +83,13 @@ export default function ReviewHistory({
     const requestId = ++detailRequestId.current;
     setDetailError('');
     try {
-      const res = await api.getContentDetail(contentId);
+      const res = await api.getContentDetail(contentId, brandId);
       if (requestId !== detailRequestId.current) return;
       if (!res.success) throw new Error(res.error || 'Could not load audit details.');
       if (brandId && res.content?.brand_id !== brandId) {
         throw new Error('This content does not belong to the selected brand.');
       }
-      setSelectedDetail(res);
+      selectContentDetail(res);
       setActiveModalTab('versions');
       setDetailModalOpen(true);
     } catch (err) {
@@ -69,9 +99,17 @@ export default function ReviewHistory({
     }
   };
 
+  const handleEditContent = (content) => {
+    if (!onEditContent) return;
+    setDetailModalOpen(false);
+    onEditContent(content);
+  };
+
   useEffect(() => {
     detailRequestId.current += 1;
     setSelectedDetail(null);
+    setComparisonLeftVersion('');
+    setComparisonRightVersion('');
     setDetailModalOpen(false);
     setDetailError('');
   }, [brandId]);
@@ -84,13 +122,13 @@ export default function ReviewHistory({
     const loadInitialDetail = async () => {
       setDetailError('');
       try {
-        const res = await api.getContentDetail(initialContentId);
+        const res = await api.getContentDetail(initialContentId, brandId);
         if (!active || requestId !== detailRequestId.current) return;
         if (!res.success) throw new Error(res.error || 'Could not load audit details.');
         if (brandId && res.content?.brand_id !== brandId) {
           throw new Error('This content does not belong to the selected brand.');
         }
-        setSelectedDetail(res);
+        selectContentDetail(res);
         setActiveModalTab('versions');
         setDetailModalOpen(true);
       } catch (err) {
@@ -112,7 +150,7 @@ export default function ReviewHistory({
 
   const handleExportReport = async (contentId) => {
     try {
-      const res = await api.exportAuditReport(contentId);
+      const res = await api.exportAuditReport(contentId, brandId);
       if (!res.success) throw new Error(res.error || 'Could not export the audit report.');
       const reportBlob = new Blob([JSON.stringify(res.report, null, 2)], {
         type: 'application/json',
@@ -158,6 +196,14 @@ export default function ReviewHistory({
       </span>
     );
   };
+
+  const savedVersions = getSavedVersions(selectedDetail);
+  const leftVersion = savedVersions.find(
+    (version) => String(version.version_number) === comparisonLeftVersion
+  );
+  const rightVersion = savedVersions.find(
+    (version) => String(version.version_number) === comparisonRightVersion
+  );
 
   return (
     <div className="space-y-4">
@@ -254,6 +300,15 @@ export default function ReviewHistory({
                       </button>
 
                       <button
+                        onClick={() => handleEditContent(item)}
+                        className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors"
+                        title="Edit and resubmit as a new version"
+                      >
+                        <Pencil className="w-3 h-3 text-slate-500" />
+                        <span>Edit</span>
+                      </button>
+
+                      <button
                         onClick={() => handleExportReport(item.id)}
                         className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors"
                         title="Download JSON Report"
@@ -328,6 +383,16 @@ export default function ReviewHistory({
               >
                 Original vs Corrected Diff
               </button>
+              <button
+                onClick={() => setActiveModalTab('compare')}
+                className={`pb-2.5 border-b-2 transition-all ${
+                  activeModalTab === 'compare'
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-slate-500 hover:text-slate-900'
+                }`}
+              >
+                Compare Versions
+              </button>
             </div>
 
             {/* Modal Body */}
@@ -387,6 +452,78 @@ export default function ReviewHistory({
                   originalText={selectedDetail.content.original_text}
                   correctedText={selectedDetail.content.corrected_text}
                 />
+              )}
+
+              {activeModalTab === 'compare' && (
+                <section aria-label="Saved version comparison" className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <label className="block text-xs font-semibold text-slate-700">
+                      First saved version
+                      <select
+                        aria-label="First saved version"
+                        value={comparisonLeftVersion}
+                        onChange={(event) => setComparisonLeftVersion(event.target.value)}
+                        className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-normal text-slate-700"
+                      >
+                        <option value="">Select a version</option>
+                        {savedVersions.map((version) => (
+                          <option key={version.version_number} value={version.version_number}>
+                            Version {version.version_number} - {formatVersionDate(version.created_at)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="block text-xs font-semibold text-slate-700">
+                      Second saved version
+                      <select
+                        aria-label="Second saved version"
+                        value={comparisonRightVersion}
+                        onChange={(event) => setComparisonRightVersion(event.target.value)}
+                        className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-normal text-slate-700"
+                      >
+                        <option value="">Select a version</option>
+                        {savedVersions.map((version) => (
+                          <option key={version.version_number} value={version.version_number}>
+                            Version {version.version_number} - {formatVersionDate(version.created_at)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+
+                  {savedVersions.length < 2 ? (
+                    <div role="status" className="p-6 text-center text-slate-500 text-xs">
+                      {savedVersions.length === 0
+                        ? 'No saved versions are available to compare.'
+                        : 'At least two saved versions are required for comparison.'}
+                    </div>
+                  ) : comparisonLeftVersion && comparisonRightVersion &&
+                    comparisonLeftVersion === comparisonRightVersion ? (
+                    <div role="alert" className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-800">
+                      Select two different saved versions to compare.
+                    </div>
+                  ) : !leftVersion || !rightVersion ? (
+                    <div role="status" className="p-6 text-center text-slate-500 text-xs">
+                      Select two saved versions to compare.
+                    </div>
+                  ) : (
+                    <>
+                      {leftVersion.text === rightVersion.text && (
+                        <div role="status" className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3 text-xs text-blue-800">
+                          These versions contain identical text.
+                        </div>
+                      )}
+                      <DiffViewer
+                        heading="Saved Version Comparison"
+                        originalLabel={`Version ${leftVersion.version_number} - ${formatVersionDate(leftVersion.created_at)}`}
+                        correctedLabel={`Version ${rightVersion.version_number} - ${formatVersionDate(rightVersion.created_at)}`}
+                        originalText={leftVersion.text}
+                        correctedText={rightVersion.text}
+                        showComplianceStatus={false}
+                      />
+                    </>
+                  )}
+                </section>
               )}
             </div>
 

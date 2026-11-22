@@ -1,15 +1,84 @@
 import json
 import logging
-from flask import Blueprint, jsonify
-from api_utils import is_positive_int, json_object_payload, validate_string_fields
+import re
+import time
+from functools import wraps
+from flask import Blueprint, current_app, jsonify, request
+from werkzeug.utils import secure_filename
+from api_utils import (
+    MAX_GEMINI_TEXT_LENGTH,
+    MAX_VISUAL_IMAGE_BYTES,
+    is_positive_int,
+    json_object_payload,
+    validate_id_field,
+    validate_list_field,
+    validate_query_id,
+    validate_required_fields,
+    validate_string_fields,
+)
 from database import db_session, dict_from_row
 from services.correction_engine import apply_corrections as apply_correction_plan
 from services.analyzer import GovernanceAnalyzer
+from services.ai_service import (
+    GeminiRewriteValidationError,
+    GeminiUnavailableError,
+    GeminiVisualAnalysisUnavailableError,
+    GeminiVisualAnalysisValidationError,
+)
+from extensions import limiter
 
 logger = logging.getLogger(__name__)
 
 analysis_bp = Blueprint("analysis", __name__, url_prefix="/api/analysis")
 analyzer = GovernanceAnalyzer()
+
+def _detect_visual_image_mime(image_bytes):
+    if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if image_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if (
+        len(image_bytes) >= 12
+        and image_bytes[:4] == b"RIFF"
+        and image_bytes[8:12] == b"WEBP"
+    ):
+        return "image/webp"
+    return None
+
+
+gemini_analysis_limit = limiter.shared_limit(
+    lambda: current_app.config["GEMINI_ANALYSIS_RATE_LIMIT"],
+    scope="gemini-analysis",
+)
+
+
+def _log_audit_duration(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        started_at = time.perf_counter()
+        http_status = "unknown"
+        try:
+            result = view(*args, **kwargs)
+            response = result[0] if isinstance(result, tuple) and result else result
+            if (
+                isinstance(result, tuple)
+                and len(result) > 1
+                and isinstance(result[1], int)
+            ):
+                http_status = result[1]
+            else:
+                http_status = getattr(response, "status_code", "unknown")
+            return result
+        finally:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            logger.info(
+                "Gemini audit total_duration_ms=%.1f http_status=%s",
+                duration_ms,
+                http_status,
+            )
+
+    return wrapped
+
 
 @analysis_bp.route("/system-status", methods=["GET"])
 def system_status():
@@ -23,18 +92,29 @@ def system_status():
             "mode": "Gemini AI configured; rule-based fallback available" if ai_configured else "Rule-Based Fallback",
             "offline_ready": True
         })
-    except Exception as e:
-        logger.exception("Error in system-status: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error in system-status (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not retrieve AI service status."}), 500
 
 @analysis_bp.route("/quick-check", methods=["POST"])
+@gemini_analysis_limit
 def quick_check():
     data = json_object_payload()
-    validate_string_fields(data, ("text", "content_type", "channel"))
-    brand_id = data.get("brand_id")
+    validate_string_fields(
+        data,
+        ("text", "content_type", "channel"),
+        max_lengths={
+            "text": MAX_GEMINI_TEXT_LENGTH,
+            "content_type": 100,
+            "channel": 200,
+        },
+    )
+    validate_required_fields(data, ("brand_id", "text"))
+    brand_id = validate_id_field(data, "brand_id", required=True)
     text = data.get("text", "")
-    if not is_positive_int(brand_id):
-        return jsonify({"success": False, "error": "A valid brand_id is required"}), 400
     if not isinstance(text, str):
         return jsonify({"success": False, "error": "Content text must be a string"}), 400
     content_type = data.get("content_type") or "Ad Copy"
@@ -47,13 +127,166 @@ def quick_check():
         result = analyzer.analyze_content(brand_id, text, content_type, channel)
         return jsonify({"success": True, "result": result})
     except ValueError as e:
-        return jsonify({"success": False, "error": str(e)}), 404
-    except Exception as e:
-        logger.exception("Error in quick_check: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+        return jsonify({"success": False, "error": "Brand not found."}), 404
+    except Exception as error:
+        logger.error(
+            "Error in quick_check (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not complete the content check."}), 500
+
+
+@analysis_bp.route("/rewrite", methods=["POST"])
+@limiter.limit(
+    lambda: current_app.config["GEMINI_REWRITE_RATE_LIMIT"],
+    scope="gemini-rewrite",
+)
+def rewrite_content():
+    data = json_object_payload()
+    validate_string_fields(
+        data,
+        ("text", "content_type", "channel"),
+        max_lengths={
+            "text": MAX_GEMINI_TEXT_LENGTH,
+            "content_type": 100,
+            "channel": 200,
+        },
+    )
+    validate_required_fields(data, ("brand_id", "text"))
+    brand_id = validate_id_field(data, "brand_id", required=True)
+    text = data.get("text", "")
+    if not isinstance(text, str) or not text.strip():
+        return jsonify({"success": False, "error": "Content text is required for rewriting"}), 400
+
+    content_type = data.get("content_type") or "Ad Copy"
+    channel = data.get("channel") or "Digital Ads"
+
+    try:
+        rewritten_text = analyzer.rewrite_content(
+            brand_id,
+            text,
+            content_type,
+            channel,
+        )
+        return jsonify({
+            "success": True,
+            "rewritten_text": rewritten_text,
+            "engine_used": "AI_GEMINI",
+            "saved": False,
+        })
+    except ValueError as error:
+        return jsonify({"success": False, "error": "Brand not found."}), 404
+    except GeminiUnavailableError:
+        logger.warning("Gemini rewrite is unavailable.")
+        return jsonify({"success": False, "error": "AI rewrite service is unavailable."}), 503
+    except GeminiRewriteValidationError:
+        logger.warning("Gemini rewrite response failed validation.")
+        return jsonify({"success": False, "error": "AI rewrite response could not be validated."}), 502
+    except Exception as error:
+        logger.error(
+            "Error in rewrite_content (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not generate an AI rewrite."}), 500
+
+
+@analysis_bp.route("/visual-check", methods=["POST"])
+@gemini_analysis_limit
+def visual_check():
+    if (
+        request.content_length is not None
+        and request.content_length > MAX_VISUAL_IMAGE_BYTES + 65_536
+    ):
+        return jsonify({
+            "success": False,
+            "error": "Image upload must be 5 MB or smaller.",
+        }), 413
+
+    raw_brand_id = request.form.get("brand_id", "")
+    if (
+        len(raw_brand_id) > 19
+        or not re.fullmatch(r"[0-9]+", raw_brand_id)
+        or not is_positive_int(int(raw_brand_id))
+    ):
+        return jsonify({
+            "success": False,
+            "error": "A valid brand_id is required.",
+        }), 400
+    brand_id = int(raw_brand_id)
+
+    image_file = request.files.get("file")
+    if image_file is None or not image_file.filename:
+        return jsonify({"success": False, "error": "An image file is required."}), 400
+    if len(image_file.filename) > 255:
+        return jsonify({
+            "success": False,
+            "error": "Filename must be 255 characters or fewer.",
+        }), 400
+
+    image_bytes = image_file.stream.read(MAX_VISUAL_IMAGE_BYTES + 1)
+    if len(image_bytes) > MAX_VISUAL_IMAGE_BYTES:
+        return jsonify({
+            "success": False,
+            "error": "Image upload must be 5 MB or smaller.",
+        }), 413
+    if not image_bytes:
+        return jsonify({"success": False, "error": "The uploaded image is empty."}), 400
+
+    mime_type = _detect_visual_image_mime(image_bytes)
+    declared_mime = (image_file.mimetype or "").lower()
+    if (
+        mime_type is None
+        or (
+            declared_mime not in {"", "application/octet-stream", "binary/octet-stream"}
+            and declared_mime != mime_type
+        )
+    ):
+        return jsonify({
+            "success": False,
+            "error": "Upload a valid PNG, JPEG, or WebP image.",
+        }), 400
+
+    try:
+        visual_validation = analyzer.analyze_visual_content(
+            brand_id,
+            image_bytes,
+            mime_type,
+        )
+        return jsonify({
+            "success": True,
+            "filename": secure_filename(image_file.filename),
+            "saved": False,
+            "visual_validation": visual_validation,
+        })
+    except ValueError:
+        return jsonify({"success": False, "error": "Brand not found."}), 404
+    except GeminiVisualAnalysisUnavailableError:
+        logger.warning("Gemini visual analysis is unavailable.")
+        return jsonify({
+            "success": False,
+            "error": "AI visual review service is unavailable.",
+        }), 503
+    except GeminiVisualAnalysisValidationError:
+        logger.warning("Gemini visual analysis response failed validation.")
+        return jsonify({
+            "success": False,
+            "error": "AI visual review response could not be validated.",
+        }), 502
+    except Exception as error:
+        logger.error(
+            "Error in visual_check (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({
+            "success": False,
+            "error": "Could not complete the visual review.",
+        }), 500
+
 
 @analysis_bp.route("/audit", methods=["POST"])
 @analysis_bp.route("/run", methods=["POST"])
+@gemini_analysis_limit
+@_log_audit_duration
 def audit_content():
     """
     Unified, atomic content audit endpoint.
@@ -61,20 +294,36 @@ def audit_content():
     Creates or updates content item, runs analysis, records version, and returns result.
     """
     data = json_object_payload()
-    validate_string_fields(data, ("title", "content_type", "channel", "text"))
+    validate_string_fields(
+        data,
+        ("title", "content_type", "channel", "text"),
+        max_lengths={
+            "title": 250,
+            "content_type": 100,
+            "channel": 200,
+            "text": MAX_GEMINI_TEXT_LENGTH,
+        },
+    )
+    validate_required_fields(data, ("brand_id", "text"))
     content_id = data.get("content_id")
-    brand_id = data.get("brand_id")
+    current_version = data.get("current_version")
+    brand_id = validate_id_field(data, "brand_id", required=True)
     title = data.get("title", "")
     content_type = data.get("content_type") or "Ad Copy"
     channel = data.get("channel") or "Digital Ads"
     text = data.get("text", "")
 
-    if not is_positive_int(brand_id):
-        return jsonify({"success": False, "error": "A valid brand_id is required"}), 400
     if not isinstance(text, str):
         return jsonify({"success": False, "error": "Content text must be a string"}), 400
     if content_id is not None and not is_positive_int(content_id):
         return jsonify({"success": False, "error": "A valid content_id is required"}), 400
+    if current_version is not None and not is_positive_int(current_version):
+        return jsonify({"success": False, "error": "A valid current_version is required"}), 400
+    if content_id is not None and current_version is None:
+        return jsonify({
+            "success": False,
+            "error": "current_version is required when updating existing content",
+        }), 400
     title = title.strip() if isinstance(title, str) else ""
     if not text.strip():
         return jsonify({"success": False, "error": "Content text is required for analysis."}), 400
@@ -93,6 +342,12 @@ def audit_content():
                 return jsonify({"success": False, "error": "Content item not found"}), 404
             if existing_content["brand_id"] != brand_id:
                 return jsonify({"success": False, "error": "Content does not belong to the selected brand"}), 400
+            if existing_content["current_version"] != current_version:
+                return jsonify({
+                    "success": False,
+                    "error": "Content changed after this edit began. Reload the latest version before saving.",
+                    "current_version": existing_content["current_version"],
+                }), 409
 
         # Run analysis (AI or Rule-based fallback)
         result = analyzer.analyze_content(brand_id, text, content_type, channel)
@@ -117,7 +372,7 @@ def audit_content():
                 """, (
                     text, result["score"], result["risk_level"], result["corrected_text"],
                     content_type, channel, version_num, content_id,
-                    existing_content["current_version"],
+                    current_version,
                 ))
                 if cursor.rowcount != 1:
                     return jsonify({
@@ -170,26 +425,43 @@ def audit_content():
             "status": "pending_review",
             "result": result
         })
-    except Exception as e:
-        logger.exception("Error in audit_content: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error in audit_content (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not complete the content audit."}), 500
 
 @analysis_bp.route("/run/<content_id>", methods=["POST"])
+@gemini_analysis_limit
 def run_analysis_by_id(content_id):
     """Fallback route for existing content item by ID."""
     try:
         cid = int(content_id)
     except (ValueError, TypeError):
-        return jsonify({"success": False, "error": f"Invalid content ID: '{content_id}'. Must be an integer."}), 400
+        return jsonify({"success": False, "error": "A valid content ID is required."}), 400
+    if not is_positive_int(cid):
+        return jsonify({"success": False, "error": "A valid content ID is required."}), 400
+    requested_brand_id = validate_query_id("brand_id")
 
     try:
         with db_session() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM content_items WHERE id = ?", (cid,))
+            query = "SELECT * FROM content_items WHERE id = ?"
+            params = [cid]
+            if requested_brand_id is not None:
+                query += " AND brand_id = ?"
+                params.append(requested_brand_id)
+            cursor.execute(query, params)
             content_row = cursor.fetchone()
             if not content_row:
-                return jsonify({"success": False, "error": f"Content item with ID {cid} not found"}), 404
+                return jsonify({"success": False, "error": "Content item not found"}), 404
             content = dict_from_row(content_row)
+            if len(content.get("original_text") or "") > MAX_GEMINI_TEXT_LENGTH:
+                return jsonify({
+                    "success": False,
+                    "error": "Saved content exceeds the analysis size limit.",
+                }), 413
 
         result = analyzer.analyze_content(
             content["brand_id"], 
@@ -254,24 +526,40 @@ def run_analysis_by_id(content_id):
             "success": True, "content_id": cid, "version": version_num,
             "status": "pending_review", "result": result
         })
-    except Exception as e:
-        logger.exception("Error in run_analysis_by_id: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error in run_analysis_by_id (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not complete the content analysis."}), 500
 
 @analysis_bp.route("/apply-corrections/<int:content_id>", methods=["POST"])
+@gemini_analysis_limit
 def apply_corrections(content_id):
     data = json_object_payload()
     apply_all = data.get("apply_all", False)
     issue_ids = data.get("issue_ids")
+    content_version = data.get("content_version")
     legacy_text = data.get("corrected_text")
+    brand_id = validate_id_field(data, "brand_id")
+    if issue_ids is not None:
+        issue_ids = validate_list_field(
+            data,
+            "issue_ids",
+            max_items=100,
+            item_type=str,
+            required=True,
+        )
     if not isinstance(apply_all, bool):
         return jsonify({"success": False, "error": "apply_all must be a boolean"}), 400
     if issue_ids is not None and (
-        not isinstance(issue_ids, list)
-        or not issue_ids
-        or not all(isinstance(issue_id, str) and issue_id for issue_id in issue_ids)
+        not issue_ids or not all(issue_id for issue_id in issue_ids)
     ):
         return jsonify({"success": False, "error": "issue_ids must be a non-empty list of issue IDs"}), 400
+    if content_version is not None and not is_positive_int(content_version):
+        return jsonify({"success": False, "error": "content_version must be a positive integer"}), 400
+    if issue_ids is not None and content_version is None:
+        return jsonify({"success": False, "error": "content_version is required for individual corrections"}), 400
     if apply_all and issue_ids is not None:
         return jsonify({"success": False, "error": "Choose either apply_all or issue_ids"}), 400
     if legacy_text is not None and (apply_all or issue_ids is not None):
@@ -281,11 +569,13 @@ def apply_corrections(content_id):
     if legacy_text is not None and (
         not isinstance(legacy_text, str)
         or not legacy_text
-        or len(legacy_text) > 100_000
+        or len(legacy_text) > MAX_GEMINI_TEXT_LENGTH
     ):
-        return jsonify({"success": False, "error": "corrected_text must contain 1 to 100000 characters"}), 400
+        return jsonify({"success": False, "error": f"corrected_text must contain 1 to {MAX_GEMINI_TEXT_LENGTH} characters"}), 400
 
     try:
+        if not is_positive_int(content_id):
+            return jsonify({"success": False, "error": "A valid content ID is required."}), 404
         with db_session() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM content_items WHERE id = ?", (content_id,))
@@ -293,15 +583,46 @@ def apply_corrections(content_id):
             if not content_row:
                 return jsonify({"success": False, "error": f"Content item {content_id} not found"}), 404
             content = dict_from_row(content_row)
+            if brand_id is not None and content["brand_id"] != brand_id:
+                return jsonify({
+                    "success": False,
+                    "error": "Content not found for the requested brand.",
+                }), 404
+            if len(content.get("original_text") or "") > MAX_GEMINI_TEXT_LENGTH:
+                return jsonify({
+                    "success": False,
+                    "error": "Saved content exceeds the analysis size limit.",
+                }), 413
+            if content_version is not None and content_version != content["current_version"]:
+                return jsonify({
+                    "success": False,
+                    "error": "The selected correction belongs to an older content version. Run the audit again.",
+                    "current_version": content["current_version"],
+                }), 409
+            issues = []
+            if apply_all or issue_ids is not None:
+                cursor.execute("""
+                    SELECT issues
+                    FROM analysis_results
+                    WHERE content_id = ? AND version_number = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                """, (content_id, content["current_version"]))
+                analysis_row = cursor.fetchone()
+                if not analysis_row:
+                    return jsonify({
+                        "success": False,
+                        "error": "No audit result exists for the current content version. Run the audit again.",
+                    }), 409
+                saved_issues = analysis_row["issues"]
+                issues = json.loads(saved_issues) if isinstance(saved_issues, str) else saved_issues
+                if not isinstance(issues, list) or not all(isinstance(issue, dict) for issue in issues):
+                    return jsonify({
+                        "success": False,
+                        "error": "The saved audit issues are invalid. Run the audit again.",
+                    }), 409
 
         source_text = content["original_text"]
-        source_analysis = analyzer.analyze_content(
-            content["brand_id"],
-            source_text,
-            content["content_type"],
-            content["channel"],
-        )
-        issues = source_analysis.get("issues", [])
         applied_issue_ids = []
         correction_plan = None
 
@@ -315,6 +636,29 @@ def apply_corrections(content_id):
                         "success": False,
                         "error": "The selected issue is no longer present. Run the audit again.",
                         "stale_issue_ids": missing_ids,
+                    }), 409
+                option_issue_ids = set()
+                for issue in issues:
+                    options = issue.get("replacement_options")
+                    if not isinstance(options, list):
+                        continue
+                    option_issue_ids.update(
+                        option["issue_id"]
+                        for option in options
+                        if isinstance(option, dict)
+                        and isinstance(option.get("issue_id"), str)
+                    )
+                individually_fixable_ids = {
+                    issue.get("id")
+                    for issue in issues
+                    if issue.get("auto_fixable") is True
+                } | option_issue_ids
+                manual_only_ids = sorted(set(requested_ids) - individually_fixable_ids)
+                if manual_only_ids:
+                    return jsonify({
+                        "success": False,
+                        "error": "The selected issue has no validated replacement and requires manual review.",
+                        "manual_review_issue_ids": manual_only_ids,
                     }), 409
             correction_plan = apply_correction_plan(source_text, issues, requested_ids)
             new_text = correction_plan["text"]
@@ -336,6 +680,12 @@ def apply_corrections(content_id):
             new_text = legacy_text
             if new_text == source_text:
                 return jsonify({"success": False, "error": "The submitted text has no changes."}), 409
+
+        if len(new_text) > MAX_GEMINI_TEXT_LENGTH:
+            return jsonify({
+                "success": False,
+                "error": f"Corrected text exceeds the {MAX_GEMINI_TEXT_LENGTH}-character limit.",
+            }), 413
 
         new_version = content["current_version"] + 1
 
@@ -365,10 +715,17 @@ def apply_corrections(content_id):
                     if still_present:
                         unresolved_applied_issue_ids.append(issue_id)
 
+        remaining_issues = result.get("issues", [])
+        remaining_critical_issues = [
+            issue for issue in remaining_issues
+            if str(issue.get("severity") or "").upper() == "CRITICAL"
+        ]
         correction_review = {
             "manual_review_required": True,
             "grammar_validated": False,
-            "remaining_issue_count": len(result.get("issues", [])),
+            "remaining_issue_count": len(remaining_issues),
+            "remaining_critical_issue_count": len(remaining_critical_issues),
+            "compliant": not remaining_issues,
             "unresolved_applied_issue_ids": unresolved_applied_issue_ids,
         }
 
@@ -432,6 +789,9 @@ def apply_corrections(content_id):
             "result": result, 
             "message": f"Applied corrections and updated to version {new_version}."
         })
-    except Exception as e:
-        logger.exception("Error in apply_corrections: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error in apply_corrections (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not apply the requested correction."}), 500

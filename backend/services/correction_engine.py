@@ -1,6 +1,6 @@
 import re
 import unicodedata
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 
 _INSTRUCTION_PREFIX = re.compile(
@@ -45,6 +45,87 @@ def safe_replacement_text(replacement_text: Any, matched_text: Optional[str] = N
         return None
 
 
+def attach_replacement_options(
+    source_text: str,
+    issues: Iterable[Dict[str, Any]],
+) -> None:
+    replacements_by_span = {}
+
+    for issue in issues:
+        issue.pop("replacement_options", None)
+        if not (
+            issue.get("auto_fixable") is True
+            or issue.get("replacement_choice_required") is True
+        ):
+            continue
+
+        matched_text = issue.get("matched_text")
+        location = issue.get("location")
+        if not isinstance(location, dict):
+            continue
+        start, end = location.get("start"), location.get("end")
+        if (
+            not isinstance(matched_text, str)
+            or not matched_text
+            or not isinstance(start, int)
+            or isinstance(start, bool)
+            or not isinstance(end, int)
+            or isinstance(end, bool)
+            or start < 0
+            or end <= start
+            or end > len(source_text)
+            or source_text[start:end] != matched_text
+            or not isinstance(issue.get("id"), str)
+            or not issue["id"]
+        ):
+            continue
+
+        replacement = safe_replacement_text(
+            issue.get("replacement_text"), matched_text
+        )
+        if replacement is not None and not _fits_claim_replacement_span(
+            source_text,
+            start,
+            end,
+            str(issue.get("category") or "").casefold(),
+            replacement,
+        ):
+            issue["auto_fixable"] = False
+            issue["manual_review_required"] = True
+            issue["manual_review_reason"] = (
+                "A full-sentence claim replacement cannot be applied to a partial source span."
+            )
+            continue
+        if replacement is not None:
+            replacements_by_span.setdefault((start, end), []).append(
+                (issue, _case_adjusted_replacement(matched_text, replacement))
+            )
+
+    for span_issues in replacements_by_span.values():
+        options_by_replacement = {}
+        for issue, replacement in span_issues:
+            options_by_replacement.setdefault(replacement, issue)
+        if len(options_by_replacement) < 2:
+            continue
+
+        options = [
+            {
+                "issue_id": issue["id"],
+                "rule": issue.get("rule") or issue.get("category") or "Policy",
+                "replacement_text": replacement,
+            }
+            for replacement, issue in options_by_replacement.items()
+        ]
+        for issue, _ in span_issues:
+            issue["replacement_options"] = options
+            issue["auto_fixable"] = False
+            issue["replacement_choice_required"] = True
+            issue["manual_review_required"] = True
+            issue["manual_review_reason"] = (
+                "Choose one validated replacement for this text span."
+            )
+
+
 def legacy_terminology_replacement(rule: Dict[str, Any]) -> Optional[str]:
     explicit = rule.get("replacement_text")
     if explicit is not None:
@@ -76,6 +157,29 @@ def _case_adjusted_replacement(matched_text: str, replacement_text: str) -> str:
     return replacement_text
 
 
+def _sentence_span(text: str, start: int, end: int) -> Optional[Tuple[int, int]]:
+    for match in re.finditer(r"[^.!?\r\n]+(?:[.!?]+|$)", text):
+        if match.start() <= start and end <= match.end():
+            return match.span()
+    return None
+
+
+def _is_complete_sentence(text: str) -> bool:
+    return bool(re.search(r"[.!?][\"'’”)\]]*\s*$", text))
+
+
+def _fits_claim_replacement_span(
+    text: str,
+    start: int,
+    end: int,
+    category: str,
+    replacement: str,
+) -> bool:
+    if "claim" not in category or not _is_complete_sentence(replacement):
+        return True
+    return _sentence_span(text, start, end) == (start, end)
+
+
 def apply_corrections(
     text: str,
     issues: Iterable[Dict[str, Any]],
@@ -87,6 +191,7 @@ def apply_corrections(
     selected_ids: Optional[Set[str]] = set(issue_ids) if issue_ids is not None else None
     unknown_ids = set(selected_ids or ())
     manual_review = {}
+    conflicting_issue_ids = set()
     by_span = {}
 
     for issue in issues:
@@ -94,6 +199,8 @@ def apply_corrections(
         if issue_id is not None:
             unknown_ids.discard(issue_id)
         selected = selected_ids is None or issue_id in selected_ids
+        if not selected:
+            continue
 
         matched_text = issue.get("matched_text")
         location = issue.get("location")
@@ -101,13 +208,18 @@ def apply_corrections(
             location = {}
         start, end = location.get("start"), location.get("end")
         replacement_text = issue.get("replacement_text")
+        selected_choice = (
+            selected_ids is not None
+            and selected
+            and issue.get("replacement_choice_required") is True
+        )
         try:
             replacement = validate_replacement_text(replacement_text, matched_text)
         except ValueError:
             replacement = None
 
         if (
-            issue.get("auto_fixable") is not True
+            (issue.get("auto_fixable") is not True and not selected_choice)
             or replacement is None
             or not isinstance(matched_text, str)
             or not matched_text
@@ -125,10 +237,18 @@ def apply_corrections(
             continue
 
         replacement = _case_adjusted_replacement(matched_text, replacement)
+        category = str(issue.get("category") or "").casefold()
+        if not _fits_claim_replacement_span(text, start, end, category, replacement):
+            if selected and issue_id is not None:
+                manual_review[issue_id] = (
+                    "A full-sentence claim replacement cannot be applied to a partial source span."
+                )
+            continue
         by_span.setdefault((start, end), []).append({
             "id": issue_id,
             "replacement": replacement,
             "selected": selected,
+            "category": category,
         })
 
     for issue_id in unknown_ids:
@@ -145,6 +265,7 @@ def apply_corrections(
         if len(replacements) != 1:
             for issue_id in selected_ids_for_span:
                 manual_review[issue_id] = "Conflicting rules propose different replacements for the same span."
+                conflicting_issue_ids.add(issue_id)
             continue
         candidates.append({
             "start": start,
@@ -195,6 +316,7 @@ def apply_corrections(
         "text": corrected_text,
         "applied_issue_ids": applied_ids,
         "manual_review": manual_review,
+        "conflicting_issue_ids": sorted(conflicting_issue_ids),
         "unknown_issue_ids": sorted(unknown_ids),
         "replacement_locations": replacement_locations,
     }

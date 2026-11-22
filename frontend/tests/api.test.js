@@ -32,3 +32,97 @@ test('API helper reports non-JSON upstream failures without parsing HTML as JSON
   assert.match(response.error, /HTTP 502/);
   assert.match(response.error, /proxy unavailable/);
 });
+
+test('API helper preserves stale-version metadata from correction conflicts', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    success: false,
+    error: 'The selected correction belongs to an older content version.',
+    current_version: 6,
+  }), {
+    status: 409,
+    headers: { 'content-type': 'application/json' },
+  });
+
+  const result = await api.applyCorrections(55, {
+    brand_id: 7,
+    issue_ids: ['issue-1'],
+    content_version: 5,
+  });
+
+  assert.equal(result.status, 409);
+  assert.equal(result.current_version, 6);
+});
+
+test('rewrite API posts the brand, text, content type, and channel', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url: String(url), options };
+    return new Response(JSON.stringify({
+      success: true,
+      rewritten_text: 'Rewritten preview',
+      engine_used: 'AI_GEMINI',
+      saved: false,
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const payload = {
+    brand_id: 7,
+    text: 'Original copy',
+    content_type: 'Ad Copy',
+    channel: 'Website',
+  };
+  const result = await api.rewriteContent(payload);
+
+  assert.equal(request.url.endsWith('/api/analysis/rewrite'), true);
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers['Content-Type'], 'application/json');
+  assert.deepEqual(JSON.parse(request.options.body), payload);
+  assert.equal(result.rewritten_text, 'Rewritten preview');
+  assert.equal(result.engine_used, 'AI_GEMINI');
+  assert.equal(result.saved, false);
+});
+
+test('visual review API sends the image and brand without exposing configuration', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+  let request;
+  globalThis.fetch = async (url, options) => {
+    request = { url: String(url), options };
+    return new Response(JSON.stringify({
+      success: true,
+      saved: false,
+      visual_validation: {
+        supported: true,
+        checks: [],
+        not_evaluated: [],
+      },
+    }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+
+  const image = new Blob(['mock image'], { type: 'image/png' });
+  const result = await api.analyzeVisualFile(image, 23);
+
+  assert.equal(request.url.endsWith('/api/analysis/visual-check'), true);
+  assert.equal(request.options.method, 'POST');
+  assert.equal(request.options.headers, undefined);
+  assert.equal(request.options.body.get('brand_id'), '23');
+  assert.equal(request.options.body.get('file').type, 'image/png');
+  assert.equal(result.saved, false);
+  assert.equal(result.visual_validation.supported, true);
+});

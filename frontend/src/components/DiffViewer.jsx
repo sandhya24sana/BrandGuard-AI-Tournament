@@ -1,7 +1,16 @@
 import React, { useState } from 'react';
 import { Copy, Check, Sparkles } from 'lucide-react';
 
-export default function DiffViewer({ originalText, correctedText, onApplyAll }) {
+export default function DiffViewer({
+  originalText,
+  correctedText,
+  onApplyAll,
+  complianceApproved = false,
+  heading = 'Brand Revision',
+  originalLabel = 'Original Copy',
+  correctedLabel = 'Brand-Aligned Version',
+  showComplianceStatus = true,
+}) {
   const [viewMode, setViewMode] = useState('split');
   const [copied, setCopied] = useState(false);
 
@@ -27,7 +36,7 @@ export default function DiffViewer({ originalText, correctedText, onApplyAll }) 
         <div className="flex items-center gap-2">
           <span className="font-semibold text-slate-700 flex items-center gap-1.5">
             <Sparkles className="w-3.5 h-3.5 text-blue-600" />
-            Brand Revision
+            {heading}
           </span>
           <div className="flex items-center bg-slate-200/80 rounded-lg p-0.5">
             <button
@@ -76,7 +85,7 @@ export default function DiffViewer({ originalText, correctedText, onApplyAll }) 
             {/* Original Draft */}
             <div className="flex flex-col bg-slate-50 p-4 rounded-xl border border-slate-200">
               <div className="flex items-center justify-between text-xs font-semibold text-slate-600 mb-2 pb-2 border-b border-slate-200">
-                <span>Original Copy</span>
+                <span>{originalLabel}</span>
                 <span className="text-[10px] text-slate-400 uppercase font-medium">Unchecked</span>
               </div>
               <div className="text-slate-700 whitespace-pre-wrap leading-relaxed font-sans">
@@ -87,10 +96,16 @@ export default function DiffViewer({ originalText, correctedText, onApplyAll }) 
             {/* Revised Copy */}
             <div className="flex flex-col bg-emerald-50/50 p-4 rounded-xl border border-emerald-200">
               <div className="flex items-center justify-between text-xs font-semibold text-emerald-800 mb-2 pb-2 border-b border-emerald-200">
-                <span>Brand-Aligned Version</span>
-                <span className="text-[10px] font-semibold bg-emerald-100 text-emerald-800 px-2 py-0.5 rounded">
-                  Compliance Approved
-                </span>
+                <span>{correctedLabel}</span>
+                {showComplianceStatus && (
+                  <span className={`text-[10px] font-semibold px-2 py-0.5 rounded ${
+                    complianceApproved
+                      ? 'bg-emerald-100 text-emerald-800'
+                      : 'bg-amber-100 text-amber-800'
+                  }`}>
+                    {complianceApproved ? 'Compliance Approved' : 'Needs Review'}
+                  </span>
+                )}
               </div>
               <div className="text-slate-800 whitespace-pre-wrap leading-relaxed font-sans font-medium">
                 {correctedText}
@@ -100,11 +115,11 @@ export default function DiffViewer({ originalText, correctedText, onApplyAll }) 
         ) : (
           <div className="space-y-3">
             <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
-              <span className="text-xs font-semibold text-slate-500 block mb-1">Original Draft:</span>
+              <span className="text-xs font-semibold text-slate-500 block mb-1">{originalLabel}:</span>
               <p className="text-slate-700 text-xs whitespace-pre-wrap">{originalText}</p>
             </div>
             <div className="p-3 bg-emerald-50/50 rounded-xl border border-emerald-200">
-              <span className="text-xs font-semibold text-emerald-700 block mb-1">BrandGuard Revised:</span>
+              <span className="text-xs font-semibold text-emerald-700 block mb-1">{correctedLabel}:</span>
               <p className="text-slate-800 text-xs font-medium whitespace-pre-wrap">{correctedText}</p>
             </div>
           </div>

@@ -9,7 +9,12 @@ import IssueCard from '../components/IssueCard';
 import DiffViewer from '../components/DiffViewer';
 import ReviewActionModal from '../components/ReviewActionModal';
 
-export default function ContentAnalyzer({ brandId, brandName }) {
+export default function ContentAnalyzer({
+  brandId,
+  brandName,
+  contentToEdit,
+  onCancelEdit
+}) {
   // Metadata
   const [title, setTitle] = useState('');
   const [contentType, setContentType] = useState('Ad Copy');
@@ -19,6 +24,11 @@ export default function ContentAnalyzer({ brandId, brandName }) {
   // State
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isUploading, setIsUploading] = useState(false);
+  const [isVisualAnalyzing, setIsVisualAnalyzing] = useState(false);
+  const [isRewriting, setIsRewriting] = useState(false);
+  const [isSavingRewrite, setIsSavingRewrite] = useState(false);
+  const [rewritePreview, setRewritePreview] = useState(null);
+  const [rewriteError, setRewriteError] = useState('');
   const [contentId, setContentId] = useState(null);
   const [savedText, setSavedText] = useState('');
   const [currentVersion, setCurrentVersion] = useState(1);
@@ -26,6 +36,15 @@ export default function ContentAnalyzer({ brandId, brandName }) {
   
   // Analysis Output
   const [analysisResult, setAnalysisResult] = useState(null);
+  const [auditedVersion, setAuditedVersion] = useState(null);
+  const [isAuditStale, setIsAuditStale] = useState(false);
+  const [visualResult, setVisualResult] = useState(null);
+  const [visualFileName, setVisualFileName] = useState('');
+  const [visualError, setVisualError] = useState('');
+  const [revisionOriginalText, setRevisionOriginalText] = useState(null);
+  const [revisionText, setRevisionText] = useState(null);
+  const [revisionComplianceApproved, setRevisionComplianceApproved] = useState(false);
+  const [selectedReplacementOptions, setSelectedReplacementOptions] = useState({});
   const [activeRightTab, setActiveRightTab] = useState('issues'); // 'issues', 'diff', 'readability'
   const [selectedCategory, setSelectedCategory] = useState('ALL');
 
@@ -37,6 +56,7 @@ export default function ContentAnalyzer({ brandId, brandName }) {
   const [toastMessage, setToastMessage] = useState(null);
   const fileInputRef = useRef(null);
   const isApplyingFixRef = useRef(false);
+  const rewriteRequestRef = useRef(0);
   const [isApplyingFix, setIsApplyingFix] = useState(false);
 
   const showToast = (msg, type = 'success') => {
@@ -44,42 +64,107 @@ export default function ContentAnalyzer({ brandId, brandName }) {
     setTimeout(() => setToastMessage(null), 3500);
   };
 
+  const clearRevision = () => {
+    setRevisionOriginalText(null);
+    setRevisionText(null);
+    setRevisionComplianceApproved(false);
+  };
+
+  const clearRewritePreview = () => {
+    rewriteRequestRef.current += 1;
+    setRewritePreview(null);
+    setRewriteError('');
+    setIsRewriting(false);
+  };
+
   useEffect(() => {
-    setTitle('');
-    setContentType('Ad Copy');
-    setChannel('Digital Ads');
-    setText('');
+    rewriteRequestRef.current += 1;
+    setRewritePreview(null);
+    setRewriteError('');
+    setIsRewriting(false);
+    const originalText = contentToEdit?.original_text || '';
+    setTitle(contentToEdit?.title || '');
+    setContentType(contentToEdit?.content_type || 'Ad Copy');
+    setChannel(contentToEdit?.channel || 'Digital Ads');
+    setText(originalText);
     setAnalysisResult(null);
-    setContentId(null);
-    setSavedText('');
-    setCurrentVersion(1);
-    setStatus('draft');
+    setAuditedVersion(null);
+    setIsAuditStale(false);
+    setVisualResult(null);
+    setVisualFileName('');
+    setVisualError('');
+    setRevisionOriginalText(null);
+    setRevisionText(null);
+    setRevisionComplianceApproved(false);
+    setSelectedReplacementOptions({});
+    setContentId(contentToEdit?.id || null);
+    setSavedText(originalText);
+    setCurrentVersion(contentToEdit?.current_version || 1);
+    setStatus(contentToEdit?.status || 'draft');
     setIsReviewModalOpen(false);
-  }, [brandId]);
+  }, [brandId, contentToEdit]);
 
   const handleFileUpload = async (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    const isImageFile = file.type.startsWith('image/')
+      || /\.(png|jpe?g|webp)$/i.test(file.name);
     setIsUploading(true);
     try {
+      if (isImageFile) {
+        setVisualError('');
+        setVisualResult(null);
+        setVisualFileName(file.name);
+        if (!brandId) {
+          throw new Error('Select a brand before requesting an image review.');
+        }
+
+        setIsVisualAnalyzing(true);
+        const visualResponse = await api.analyzeVisualFile(file, brandId);
+        if (!visualResponse.success || !visualResponse.visual_validation) {
+          throw new Error(
+            visualResponse.error || 'Could not complete the visual review.'
+          );
+        }
+        setVisualResult(visualResponse.visual_validation);
+        setVisualFileName(visualResponse.filename || file.name);
+        showToast('Image review completed. Verify all findings manually.');
+        return;
+      }
+
+      setVisualResult(null);
+      setVisualFileName('');
+      setVisualError('');
       const res = await api.uploadFile(file);
       if (res.success) {
+        clearRewritePreview();
         setText(res.text);
-        setTitle(file.name.replace(/\.[^/.]+$/, ''));
+        if (!contentToEdit) {
+          setTitle(file.name.replace(/\.[^/.]+$/, ''));
+          setContentId(null);
+          setSavedText('');
+          setCurrentVersion(1);
+          setStatus('draft');
+        }
         setAnalysisResult(null);
-        setContentId(null);
-        setSavedText('');
-        setCurrentVersion(1);
-        setStatus('draft');
+        clearRevision();
+        setSelectedReplacementOptions({});
         showToast(`Document parsed (${res.word_count} words extracted).`);
       } else {
         showToast(res.error || 'Upload failed', 'error');
       }
     } catch (err) {
-      showToast('Error uploading file: ' + err.message, 'error');
+      if (isImageFile) {
+        const message = err.message || 'Could not complete the visual review.';
+        setVisualError(message);
+        showToast('Visual review failed: ' + message, 'error');
+      } else {
+        showToast('Error uploading file: ' + err.message, 'error');
+      }
     } finally {
       setIsUploading(false);
+      setIsVisualAnalyzing(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
@@ -96,8 +181,22 @@ export default function ContentAnalyzer({ brandId, brandName }) {
 
     setIsAnalyzing(true);
     try {
+      if (contentToEdit && contentId) {
+        const latestContent = await api.getContentDetail(contentId, brandId);
+        if (!latestContent.success) {
+          throw new Error(latestContent.error || 'Could not verify the current content version.');
+        }
+        if (latestContent.content?.brand_id !== brandId) {
+          throw new Error('This content no longer belongs to the selected brand. Return to Review History and reopen it.');
+        }
+        if (latestContent.content?.current_version !== currentVersion) {
+          throw new Error('Content changed after editing began. Return to Review History and edit the latest version.');
+        }
+      }
+
       const res = await api.analyzeContent({
         content_id: contentId,
+        current_version: contentId ? currentVersion : undefined,
         brand_id: brandId,
         title: title.trim() || 'Untitled Content',
         content_type: contentType,
@@ -111,7 +210,15 @@ export default function ContentAnalyzer({ brandId, brandName }) {
         }
         setSavedText(text);
         setAnalysisResult(res.result);
+        setRevisionOriginalText(text);
+        setRevisionText(res.result.corrected_text || text);
+        setRevisionComplianceApproved(
+          res.result.revision_compliance?.approved === true
+        );
+        setSelectedReplacementOptions({});
         setCurrentVersion(res.version || 1);
+        setAuditedVersion(res.version || 1);
+        setIsAuditStale(false);
         setStatus(res.status || 'pending_review');
         showToast(`Audit completed! Compliance score: ${res.result.score}/100.`);
       } else {
@@ -124,22 +231,194 @@ export default function ContentAnalyzer({ brandId, brandName }) {
     }
   };
 
-  const handleApplySingleFix = async (issue) => {
+  const handleGenerateRewrite = async () => {
+    if (!brandId) {
+      showToast('Create and select a brand before requesting an AI rewrite.', 'error');
+      return;
+    }
+    if (!text.trim()) {
+      showToast('Please enter or upload content before requesting an AI rewrite.', 'error');
+      return;
+    }
+
+    const requestId = ++rewriteRequestRef.current;
+    const source = { brandId, text, contentType, channel };
+    setRewritePreview(null);
+    setRewriteError('');
+    setIsRewriting(true);
+    try {
+      const res = await api.rewriteContent({
+        brand_id: brandId,
+        text,
+        content_type: contentType,
+        channel,
+      });
+      if (requestId !== rewriteRequestRef.current) return;
+      if (!res.success) throw new Error(res.error || 'AI rewrite failed.');
+      if (typeof res.rewritten_text !== 'string' || !res.rewritten_text.trim()) {
+        throw new Error('The AI rewrite response did not contain valid rewritten text.');
+      }
+      setRewritePreview({ rewrittenText: res.rewritten_text, source });
+    } catch (error) {
+      if (requestId === rewriteRequestRef.current) {
+        setRewriteError(error.message || 'AI rewrite failed. Please try again.');
+      }
+    } finally {
+      if (requestId === rewriteRequestRef.current) setIsRewriting(false);
+    }
+  };
+
+  const handleSaveRewrite = async () => {
+    if (!rewritePreview || isSavingRewrite) return;
+    if (!window.confirm('Save this AI rewrite as a new content version? The current version will remain in history.')) {
+      return;
+    }
+
+    const { rewrittenText, source } = rewritePreview;
+    if (
+      source.brandId !== brandId ||
+      source.text !== text ||
+      source.contentType !== contentType ||
+      source.channel !== channel
+    ) {
+      clearRewritePreview();
+      setRewriteError('The source content or settings changed. Generate a new AI rewrite preview before saving.');
+      return;
+    }
+
+    setIsSavingRewrite(true);
+    setRewriteError('');
+    try {
+      if (contentId) {
+        const latestContent = await api.getContentDetail(contentId, brandId);
+        if (!latestContent.success) {
+          throw new Error(latestContent.error || 'Could not verify the current content version.');
+        }
+        if (latestContent.content?.brand_id !== brandId) {
+          throw new Error('This content no longer belongs to the selected brand. Return to Review History and reopen it.');
+        }
+        if (latestContent.content?.current_version !== currentVersion) {
+          throw new Error('Content changed after this rewrite preview was created. Reload the latest version before saving.');
+        }
+      }
+
+      const res = await api.analyzeContent({
+        content_id: contentId || undefined,
+        current_version: contentId ? currentVersion : undefined,
+        brand_id: brandId,
+        title: title.trim() || 'Untitled Content',
+        content_type: contentType,
+        channel,
+        text: rewrittenText,
+      });
+      if (!res.success || !res.result) {
+        throw new Error(res.error || 'Could not save the AI rewrite as a new version.');
+      }
+
+      setText(rewrittenText);
+      setSavedText(rewrittenText);
+      setContentId(res.content_id);
+      setAnalysisResult(res.result);
+      setRevisionOriginalText(rewrittenText);
+      setRevisionText(res.result.corrected_text || rewrittenText);
+      setRevisionComplianceApproved(
+        res.result.revision_compliance?.approved === true
+      );
+      setSelectedReplacementOptions({});
+      setCurrentVersion(res.version || 1);
+      setAuditedVersion(res.version || 1);
+      setIsAuditStale(false);
+      setStatus(res.status || 'pending_review');
+      clearRewritePreview();
+      showToast(`Saved AI rewrite as version ${res.version || 1}.`);
+    } catch (error) {
+      setRewriteError(error.message || 'Could not save the AI rewrite.');
+    } finally {
+      setIsSavingRewrite(false);
+    }
+  };
+
+  const handleReplacementOptionChange = (issueId, optionId) => {
+    setSelectedReplacementOptions((current) => ({
+      ...current,
+      [issueId]: optionId,
+    }));
+  };
+
+  const verifyCurrentAuditVersion = async () => {
+    if (!contentId) {
+      throw new Error('Run an audit before applying a correction.');
+    }
+    if (auditedVersion === null || auditedVersion !== currentVersion) {
+      setIsAuditStale(true);
+      throw new Error('The audited content version is stale. Run the audit again.');
+    }
+
+    const latestContent = await api.getContentDetail(contentId, brandId);
+    if (!latestContent.success) {
+      throw new Error(latestContent.error || 'Could not verify the current content version.');
+    }
+    if (latestContent.content?.brand_id !== brandId) {
+      throw new Error('This content no longer belongs to the selected brand.');
+    }
+    if (latestContent.content?.current_version !== auditedVersion) {
+      setIsAuditStale(true);
+      throw new Error('The audited content version is stale. Run the audit again.');
+    }
+  };
+
+  const handleApplySingleFix = async (issue, selectedIssueId = issue.id) => {
     if (isApplyingFixRef.current) return;
     if (!contentId) {
       showToast('Run an audit before applying a correction.', 'error');
+      return;
+    }
+    const replacementOptions = Array.isArray(issue.replacement_options)
+      ? issue.replacement_options
+      : [];
+    const choiceRequired = issue.replacement_choice_required === true
+      || replacementOptions.length > 1;
+    if (
+      (choiceRequired && !replacementOptions.some(
+        (option) => option.issue_id === selectedIssueId
+      ))
+      || (!choiceRequired && selectedIssueId !== issue.id)
+    ) {
+      showToast('Choose a validated replacement before applying it.', 'error');
       return;
     }
 
     isApplyingFixRef.current = true;
     setIsApplyingFix(true);
     try {
-      const res = await api.applyCorrections(contentId, { issue_ids: [issue.id] });
-      if (!res.success) throw new Error(res.error || 'Correction could not be saved.');
+      await verifyCurrentAuditVersion();
+      const res = await api.applyCorrections(contentId, {
+        brand_id: brandId,
+        issue_ids: [selectedIssueId],
+        content_version: currentVersion,
+      });
+      if (!res.success) {
+        if (
+          res.status === 409
+          && res.current_version !== undefined
+          && res.current_version !== auditedVersion
+        ) {
+          setIsAuditStale(true);
+        }
+        throw new Error(res.error || 'Correction could not be saved.');
+      }
+      clearRewritePreview();
       setText(res.applied_text);
       setSavedText(res.applied_text);
+      setRevisionText(res.applied_text);
+      setRevisionComplianceApproved(
+        res.correction_review?.compliant === true
+      );
       setCurrentVersion(res.new_version);
+      setAuditedVersion(res.new_version);
+      setIsAuditStale(false);
       setAnalysisResult(res.result);
+      setSelectedReplacementOptions({});
       setStatus('pending_review');
       showToast(`Applied correction and saved version ${res.new_version}. Manual review is still required.`);
     } catch (err) {
@@ -160,12 +439,34 @@ export default function ContentAnalyzer({ brandId, brandName }) {
     isApplyingFixRef.current = true;
     setIsApplyingFix(true);
     try {
-      const res = await api.applyCorrections(contentId, { apply_all: true });
-      if (!res.success) throw new Error(res.error || 'Corrections could not be saved.');
+      await verifyCurrentAuditVersion();
+      const res = await api.applyCorrections(contentId, {
+        brand_id: brandId,
+        apply_all: true,
+        content_version: currentVersion,
+      });
+      if (!res.success) {
+        if (
+          res.status === 409
+          && res.current_version !== undefined
+          && res.current_version !== auditedVersion
+        ) {
+          setIsAuditStale(true);
+        }
+        throw new Error(res.error || 'Corrections could not be saved.');
+      }
+      clearRewritePreview();
       setText(res.applied_text);
       setSavedText(res.applied_text);
+      setRevisionText(res.applied_text);
+      setRevisionComplianceApproved(
+        res.correction_review?.compliant === true
+      );
       setAnalysisResult(res.result);
       setCurrentVersion(res.new_version);
+      setAuditedVersion(res.new_version);
+      setIsAuditStale(false);
+      setSelectedReplacementOptions({});
       setStatus('pending_review');
       showToast(`Applied all corrections (Updated to v${res.new_version}, Score: ${res.result.score}/100). Manual review is still required.`);
     } catch (err) {
@@ -184,6 +485,7 @@ export default function ContentAnalyzer({ brandId, brandName }) {
     if (!targetId || savedText !== text) {
       const auditRes = await api.analyzeContent({
         content_id: targetId,
+        current_version: targetId ? targetVersion : undefined,
         brand_id: brandId,
         title,
         content_type: contentType,
@@ -196,12 +498,20 @@ export default function ContentAnalyzer({ brandId, brandName }) {
       setContentId(targetId);
       setSavedText(text);
       setAnalysisResult(auditRes.result);
+      setRevisionOriginalText(text);
+      setRevisionText(auditRes.result.corrected_text || text);
+      setRevisionComplianceApproved(
+        auditRes.result.revision_compliance?.approved === true
+      );
       setCurrentVersion(targetVersion);
+      setAuditedVersion(targetVersion);
+      setIsAuditStale(false);
       setStatus('pending_review');
     }
 
     const res = await api.submitReview({
       ...reviewData,
+      brand_id: brandId,
       content_id: targetId,
       content_version: targetVersion,
     });
@@ -219,6 +529,10 @@ export default function ContentAnalyzer({ brandId, brandName }) {
   const filteredIssues = (analysisResult?.issues || []).filter(issue => {
     return selectedCategory === 'ALL' || issue.category === selectedCategory;
   });
+  const isAuditVersionStale = Boolean(
+    analysisResult
+    && (isAuditStale || auditedVersion !== currentVersion)
+  );
 
   const categories = ['ALL', 'Terminology', 'Fact Accuracy', 'Voice & Tone', 'Compliance & Claims', 'Accessibility & Clarity'];
 
@@ -263,6 +577,7 @@ export default function ContentAnalyzer({ brandId, brandName }) {
               setTitle(e.target.value);
               setSavedText(null);
               setAnalysisResult(null);
+              clearRevision();
               setStatus('draft');
             }}
             className="w-full text-sm sm:text-base font-bold text-slate-900 focus:outline-none focus:ring-1 focus:ring-blue-600 rounded px-1 -ml-1 placeholder-slate-400"
@@ -280,9 +595,11 @@ export default function ContentAnalyzer({ brandId, brandName }) {
           <select
             value={contentType}
             onChange={(e) => {
+              clearRewritePreview();
               setContentType(e.target.value);
               setSavedText(null);
               setAnalysisResult(null);
+              clearRevision();
               setStatus('draft');
             }}
             aria-label="Content Format"
@@ -298,9 +615,11 @@ export default function ContentAnalyzer({ brandId, brandName }) {
           <select
             value={channel}
             onChange={(e) => {
+              clearRewritePreview();
               setChannel(e.target.value);
               setSavedText(null);
               setAnalysisResult(null);
+              clearRevision();
               setStatus('draft');
             }}
             aria-label="Distribution Channel"
@@ -318,18 +637,20 @@ export default function ContentAnalyzer({ brandId, brandName }) {
             type="file"
             ref={fileInputRef}
             onChange={handleFileUpload}
-            accept=".txt,.md,.markdown,.docx,.pdf,.json"
+            accept=".txt,.md,.markdown,.docx,.pdf,.json,.png,.jpg,.jpeg,.webp,image/png,image/jpeg,image/webp"
             className="hidden"
           />
 
           <button
             onClick={() => fileInputRef.current?.click()}
-            disabled={isUploading}
+            disabled={isUploading || isSavingRewrite}
             className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-medium bg-slate-50 hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors"
-            title="Upload Document (.txt, .md, .docx, .pdf)"
+            title="Upload a text document or a PNG, JPEG, or WebP image for visual review"
           >
             <Upload className="w-3.5 h-3.5 text-slate-500" />
-            <span>{isUploading ? 'Parsing...' : 'Upload Doc'}</span>
+            <span>
+              {isVisualAnalyzing ? 'Reviewing image...' : isUploading ? 'Parsing...' : 'Upload File'}
+            </span>
           </button>
         </div>
       </div>
@@ -361,8 +682,11 @@ export default function ContentAnalyzer({ brandId, brandName }) {
             <textarea
               value={text}
               onChange={(e) => {
+                clearRewritePreview();
                 setText(e.target.value);
                 setAnalysisResult(null);
+                clearRevision();
+                setSelectedReplacementOptions({});
                 setStatus('draft');
               }}
               placeholder="Paste or type content to audit..."
@@ -375,17 +699,39 @@ export default function ContentAnalyzer({ brandId, brandName }) {
             <div className="flex items-center gap-2">
               <button
                 onClick={handleRunAnalysis}
-                disabled={isAnalyzing}
+                disabled={isAnalyzing || isSavingRewrite}
                 className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-xs font-semibold text-white bg-blue-600 hover:bg-blue-700 shadow-xs transition-colors disabled:opacity-50"
               >
                 <Sparkles className={`w-3.5 h-3.5 ${isAnalyzing ? 'animate-spin' : ''}`} />
                 <span>{isAnalyzing ? 'Auditing Policy...' : 'Audit Content'}</span>
               </button>
 
+              <button
+                onClick={handleGenerateRewrite}
+                disabled={isRewriting || isSavingRewrite || !brandId || !text.trim()}
+                className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-xs font-semibold text-slate-700 bg-white hover:bg-slate-50 border border-slate-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                title="Generate a Gemini rewrite preview without saving or changing the original"
+              >
+                <Sparkles className={`w-3.5 h-3.5 text-blue-600 ${isRewriting ? 'animate-spin' : ''}`} />
+                <span>{isRewriting ? 'Generating AI rewrite...' : 'AI Rewrite'}</span>
+              </button>
+
+              {contentToEdit && onCancelEdit && (
+                <button
+                  onClick={onCancelEdit}
+                  disabled={isAnalyzing}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Discard unsaved edits and return to Review History"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>Back to Review History</span>
+                </button>
+              )}
+
               {analysisResult?.corrected_text && analysisResult.corrected_text !== text && (
                 <button
                   onClick={handleApplyAllCorrections}
-                  disabled={isApplyingFix}
+                  disabled={isApplyingFix || isAuditVersionStale}
                   className="inline-flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 transition-colors"
                   title="Replace with brand-compliant text"
                 >
@@ -416,10 +762,120 @@ export default function ContentAnalyzer({ brandId, brandName }) {
               </button>
             </div>
           </div>
+
+          {rewriteError && (
+            <p role="alert" className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+              {rewriteError}
+            </p>
+          )}
+
+          {rewritePreview && (
+            <section aria-label="AI Rewrite Preview" className="mt-4 rounded-xl border border-blue-200 bg-blue-50/50 p-4">
+              <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+                <div>
+                  <h3 className="text-xs font-bold text-slate-900">AI Rewrite Preview</h3>
+                  <p className="mt-1 text-[11px] text-slate-600">
+                    Gemini-generated preview. Your original content remains unchanged until you save.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={handleSaveRewrite}
+                    disabled={isSavingRewrite}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                    <span>{isSavingRewrite ? 'Saving version...' : 'Save as New Version'}</span>
+                  </button>
+                  <button
+                    onClick={clearRewritePreview}
+                    disabled={isSavingRewrite}
+                    className="px-3 py-1.5 rounded-lg text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 border border-slate-200 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Discard
+                  </button>
+                </div>
+              </div>
+              <div className="mt-3 rounded-lg border border-blue-100 bg-white p-3 text-sm text-slate-800 leading-relaxed whitespace-pre-wrap">
+                {rewritePreview.rewrittenText}
+              </div>
+            </section>
+          )}
         </div>
 
         {/* RIGHT COLUMN: Analysis & Governance Results */}
         <div className="lg:col-span-5 bg-white rounded-xl border border-slate-200 p-5 shadow-xs flex flex-col">
+          {visualError && (
+            <p role="alert" className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-800">
+              {visualError}
+            </p>
+          )}
+
+          {visualResult && (
+            <section aria-label="Visual brand review" className="mb-5 rounded-xl border border-violet-200 bg-violet-50/40 p-4">
+              <div className="border-b border-violet-100 pb-3">
+                <h2 className="text-xs font-bold uppercase tracking-wider text-slate-800">
+                  Visual Brand Review
+                </h2>
+                <p className="mt-1 text-[11px] text-slate-600">
+                  {visualFileName} — preliminary AI review; manually verify every result.
+                </p>
+                {visualResult.message && (
+                  <p className="mt-2 text-[11px] text-slate-600">
+                    {visualResult.message}
+                  </p>
+                )}
+              </div>
+
+              <div className="mt-3 space-y-2">
+                {(visualResult.checks || []).map((check) => (
+                  <div key={check.id} className="rounded-lg border border-slate-200 bg-white p-3">
+                    <div className="flex items-start justify-between gap-2">
+                      <h3 className="text-xs font-semibold text-slate-800">
+                        {check.rule}
+                      </h3>
+                      <span className={`shrink-0 rounded px-2 py-0.5 text-[10px] font-semibold ${
+                        check.status === 'concern'
+                          ? 'bg-amber-100 text-amber-800'
+                          : check.status === 'no_obvious_concern'
+                            ? 'bg-emerald-100 text-emerald-800'
+                            : 'bg-slate-100 text-slate-700'
+                      }`}>
+                        {check.status === 'concern'
+                          ? 'Concern'
+                          : check.status === 'no_obvious_concern'
+                            ? 'No obvious concern'
+                            : 'Uncertain'}
+                      </span>
+                    </div>
+                    <p className="mt-1.5 text-xs leading-relaxed text-slate-600">
+                      {check.evidence}
+                    </p>
+                    <p className="mt-1 text-[10px] text-slate-500">
+                      Confidence: {check.confidence || 'unknown'} · Manual review required
+                    </p>
+                  </div>
+                ))}
+              </div>
+
+              {Array.isArray(visualResult.not_evaluated)
+                && visualResult.not_evaluated.length > 0 && (
+                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                    <h3 className="text-[11px] font-bold text-amber-900">
+                      Not evaluated
+                    </h3>
+                    <ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] text-amber-900">
+                      {visualResult.not_evaluated.map((item, index) => (
+                        <li key={`${item.rule}-${index}`}>
+                          <span className="font-semibold">{item.rule}:</span> {item.reason}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+            </section>
+          )}
+
           {analysisResult ? (
             <div>
               {/* Compliance Score Header */}
@@ -515,11 +971,15 @@ export default function ContentAnalyzer({ brandId, brandName }) {
                       <div className="p-8 text-center text-slate-400 text-xs">
                         No issues detected under this filter category.
                       </div>
-                    ) : (
+                    ) : !visualResult && (
                       filteredIssues.map((issue) => (
                         <IssueCard
                           key={issue.id}
                           issue={issue}
+                          sourceText={text}
+                          isAuditStale={isAuditVersionStale}
+                          selectedReplacementOptionId={selectedReplacementOptions[issue.id]}
+                          onReplacementOptionChange={handleReplacementOptionChange}
                           onApplyFix={handleApplySingleFix}
                           isApplyingFix={isApplyingFix}
                         />
@@ -533,9 +993,10 @@ export default function ContentAnalyzer({ brandId, brandName }) {
               {activeRightTab === 'diff' && (
                 <div className="mt-3.5">
                   <DiffViewer
-                    originalText={text}
-                    correctedText={analysisResult.corrected_text}
+                    originalText={revisionOriginalText ?? text}
+                    correctedText={revisionText ?? analysisResult.corrected_text}
                     onApplyAll={handleApplyAllCorrections}
+                    complianceApproved={revisionComplianceApproved}
                   />
                 </div>
               )}

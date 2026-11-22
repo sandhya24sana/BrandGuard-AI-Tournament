@@ -1,8 +1,9 @@
 
 import json
 import logging
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, jsonify
 from database import db_session, dict_from_row
+from api_utils import is_positive_int, validate_query_id
 
 logger = logging.getLogger(__name__)
 
@@ -11,16 +12,7 @@ history_bp = Blueprint("history", __name__, url_prefix="/api/history")
 
 @history_bp.route("/dashboard-stats", methods=["GET"])
 def dashboard_stats():
-    brand_id = request.args.get("brand_id")
-
-    if brand_id is not None:
-        try:
-            brand_id = int(brand_id)
-        except ValueError:
-            return jsonify({"success": False, "error": "brand_id must be an integer"}), 400
-
-        if brand_id < 1:
-            return jsonify({"success": False, "error": "brand_id must be positive"}), 400
+    brand_id = validate_query_id("brand_id")
 
     base_filter = " WHERE brand_id = ?" if brand_id is not None else ""
     params = [brand_id] if brand_id is not None else []
@@ -149,8 +141,9 @@ def dashboard_stats():
 
             except (TypeError, ValueError, AttributeError) as error:
                 logger.warning(
-                    "Skipping malformed stored analysis issues: %s",
-                    error
+                    "Skipping malformed stored analysis issues "
+                    "(exception_category=%s)",
+                    type(error).__name__,
                 )
 
         sorted_terms = sorted(
@@ -172,33 +165,41 @@ def dashboard_stats():
             "recent_items": recent_items
         })
 
-    except Exception as e:
-        logger.exception("Error in dashboard_stats: %s", str(e))
-        return jsonify({"success": False, "error": str(e)}), 500
+    except Exception as error:
+        logger.error(
+            "Error in dashboard_stats (exception_category=%s)",
+            type(error).__name__,
+        )
+        return jsonify({"success": False, "error": "Could not retrieve dashboard statistics."}), 500
 
 
 @history_bp.route("/export/<int:content_id>", methods=["GET"])
 def export_audit_report(content_id):
+    if not is_positive_int(content_id):
+        return jsonify({"success": False, "error": "Content item not found"}), 404
+    brand_id = validate_query_id("brand_id")
     try:
         with db_session() as conn:
             cursor = conn.cursor()
 
-            cursor.execute(
-                """
+            query = """
                 SELECT c.*, b.name AS brand_name, b.industry, b.primary_tone
                 FROM content_items c
                 JOIN brands b ON c.brand_id = b.id
                 WHERE c.id = ?
-                """,
-                (content_id,)
-            )
+            """
+            params = [content_id]
+            if brand_id is not None:
+                query += " AND c.brand_id = ?"
+                params.append(brand_id)
+            cursor.execute(query, params)
 
             item = cursor.fetchone()
 
             if not item:
                 return jsonify({
                     "success": False,
-                    "error": f"Item {content_id} not found"
+                    "error": "Content item not found"
                 }), 404
 
             item_dict = dict_from_row(item)
@@ -229,10 +230,11 @@ def export_audit_report(content_id):
                     if value and isinstance(value, str):
                         try:
                             analysis[key] = json.loads(value)
-                        except (json.JSONDecodeError, TypeError):
+                        except (json.JSONDecodeError, TypeError) as error:
                             logger.warning(
-                                "Could not decode analysis field: %s",
-                                key
+                                "Could not decode analysis field "
+                                "(exception_category=%s)",
+                                type(error).__name__,
                             )
 
             # Review history
@@ -308,9 +310,12 @@ def export_audit_report(content_id):
             "report": report
         })
 
-    except Exception as e:
-        logger.exception("Error in export_audit_report: %s", str(e))
+    except Exception as error:
+        logger.error(
+            "Error in export_audit_report (exception_category=%s)",
+            type(error).__name__,
+        )
         return jsonify({
             "success": False,
-            "error": str(e)
+            "error": "Could not export the audit report."
         }), 500
